@@ -335,6 +335,8 @@ class Rasterizer:
                             mask = mask & (splats.opacities >= self.opacity_prune_threshold)
                         if self.confidence_prune_threshold >= 0 and splats.confidences is not None:
                             mask = mask & (splats.confidences >= self.confidence_prune_threshold)
+                        if splats.forward_vel is not None:
+                            mask = mask & (splats.forward_vel.norm(dim=-1) <= 1.0)
                         transitioned_splats.append(
                             splats.transition(timestamp_i, mask=mask)
                         )
