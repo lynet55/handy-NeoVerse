@@ -36,6 +36,7 @@ class Gaussians:
         backward_vel: Optional[Float[Tensor, "*batch 3"]] = None,
         backward_scales: Optional[Float[Tensor, "*batch 3"]] = None,
         backward_rotations: Optional[Float[Tensor, "*batch 3"]] = None,
+        seg_label: Optional[Float[Tensor, "*batch"]] = None,  # int64: 0=left_hand, 1=right_hand, 2=object, 3=background
     ):
         self.means = means
         self.harmonics = harmonics
@@ -95,6 +96,8 @@ class Gaussians:
         else:
             self.backward_rotations = None
 
+        self.seg_label = seg_label
+
     def keep_indices(self, indices):
         for name, value in self.__dict__.items():
             if isinstance(value, torch.Tensor):
@@ -113,12 +116,14 @@ class Gaussians:
         transitioned_opacities = self.transition_opacities(target_timestamp, mask)
         transitioned_scales = self.transition_scales(target_timestamp, mask)
         transitioned_rotations = self.transition_rotations(target_timestamp, mask)
+        transitioned_seg_label = self.transition_seg_label(target_timestamp, mask)
         return Gaussians(
             means=transitioned_means,
             harmonics=transitioned_harmonics,
             opacities=transitioned_opacities,
             scales=transitioned_scales,
             rotations=transitioned_rotations,
+            seg_label=transitioned_seg_label,
         )
 
     def transition_means(self, target_timestamp, mask):
@@ -156,6 +161,16 @@ class Gaussians:
         else:
             transitioned_harmonics = self.harmonics[[]]
         return transitioned_harmonics
+
+    def transition_seg_label(self, target_timestamp, mask):
+        if self.timestamp == -1 or target_timestamp == self.timestamp:
+            return self.seg_label[mask]
+        elif target_timestamp > self.timestamp and target_timestamp < self.forward_timestamp:
+            return self.seg_label[mask]
+        elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
+            return self.seg_label[mask]
+        else:
+            return self.seg_label[[]]
 
     def transition_opacities(self, target_timestamp, mask):
         opacities = self.opacities[mask]
@@ -292,7 +307,7 @@ class Rasterizer:
         self.bidirection = bidirection
         self.backgrounds = backgrounds
 
-    def forward(self, render_splats, render_viewmats, render_Ks, render_timestamps, sh_degree, width, height):
+    def forward(self, render_splats, render_viewmats, render_Ks, render_timestamps, sh_degree, width, height, render_classes=None):
         assert len(render_splats) == len(render_viewmats) == len(render_Ks) == len(render_timestamps), \
             "Number of batches in gaussians must match the batch size in render_viewmats and render_Ks."
         # Prevent OOM by using chunked rendering
@@ -337,6 +352,9 @@ class Rasterizer:
                             mask = mask & (splats.confidences >= self.confidence_prune_threshold)
                         if splats.forward_vel is not None:
                             mask = mask & (splats.forward_vel.norm(dim=-1) <= 1.0)
+                        if render_classes is not None and splats.seg_label is not None:
+                            classes = torch.tensor(render_classes, dtype=torch.int64, device=splats.means.device)
+                            mask = mask & torch.isin(splats.seg_label, classes)
                         transitioned_splats.append(
                             splats.transition(timestamp_i, mask=mask)
                         )
@@ -730,6 +748,9 @@ class GaussianSplatRenderer(nn.Module):
             splats["angular_velocity_fwd"] = predictions["gs_fwd_attr"].reshape(B, S-1, H * W, -1)
             splats["angular_velocity_bwd"] = predictions["gs_bwd_attr"].reshape(B, S-1, H * W, -1)
 
+        if "seg_labels" in predictions:
+            splats["seg_labels"] = predictions["seg_labels"].argmax(dim=-1).reshape(B, S, H * W)
+
         gaussians = self.separate_splats(
             splats,
             context_extrs=closed_form_inverse_se3(pose4x4).reshape(B, S, 4, 4),
@@ -800,6 +821,10 @@ class GaussianSplatRenderer(nn.Module):
             rotations=constant_splats["quats"],
             confidences=constant_splats["conf"],
             timestamp=-1,
+            seg_label=torch.full(
+                (constant_splats["means"].shape[0],), 3,
+                dtype=torch.int64, device=constant_splats["means"].device,
+            ),
         )
         return gaussians
 
@@ -832,6 +857,7 @@ class GaussianSplatRenderer(nn.Module):
                     backward_timestamp=splats["timestamp"][batch_idx, s - 1].item() if s > 0 else None,
                     backward_vel=splats["world_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "world_velocity_bwd" in splats and s > 0 else None,
                     backward_rotations=splats["angular_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "angular_velocity_bwd" in splats and s > 0 else None,
+                    seg_label=splats["seg_labels"][batch_idx, s][dynamic_mask],
                 )
                 gaussian_list.append(gs)
         return gaussian_list
