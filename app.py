@@ -2,24 +2,24 @@ import argparse
 import gc
 import json
 import os
-import torch
-import numpy as np
+# import torch
+# import numpy as np
 import gradio as gr
-from PIL import Image
-from torchvision.transforms import functional as F
+# from PIL import Image
+# from torchvision.transforms import functional as F
 
-from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
-from diffsynth import save_video
-from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
-from diffsynth.utils.app import extract_point_cloud, build_scene_glb
+# from diffsynth.pipelines.wan_video_neoverse import WanVideoNeoVersePipeline
+# from diffsynth import save_video
+# from diffsynth.utils.auxiliary import CameraTrajectory, load_video, homo_matrix_inverse
+# from diffsynth.utils.app import extract_point_cloud, build_scene_glb
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--reconstructor_path", type=str,
-                    default="models/NeoVerse/reconstructor.ckpt",
-                    help="Path to reconstructor checkpoint")
-parser.add_argument("--low_vram", action="store_true",
-                    help="Enable low-VRAM mode with model offloading")
-args, _ = parser.parse_known_args()
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--reconstructor_path", type=str,
+#                     default="models/NeoVerse/reconstructor.ckpt",
+#                     help="Path to reconstructor checkpoint")
+# parser.add_argument("--low_vram", action="store_true",
+#                     help="Enable low-VRAM mode with model offloading")
+# args, _ = parser.parse_known_args()
 
 # ---------------------------------------------------------------------------
 # Global model
@@ -31,18 +31,18 @@ PREVIEW_PATH = os.path.join(OUTPUT_ROOT, "preview.mp4")
 MASK_PATH = os.path.join(OUTPUT_ROOT, "mask.mp4")
 OUTPUT_PATH = os.path.join(OUTPUT_ROOT, "output.mp4")
 JSON_PATH = os.path.join(OUTPUT_ROOT, "trajectory.json")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Loading NeoVerse pipeline (reconstructor: {args.reconstructor_path})...")
-pipe = WanVideoNeoVersePipeline.from_pretrained(
-    local_model_path="models",
-    reconstructor_path=args.reconstructor_path,
-    lora_path="models/NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
-    lora_alpha=1.0,
-    device=device,
-    torch_dtype=torch.bfloat16,
-    enable_vram_management=args.low_vram,
-)
-print("Pipeline loaded.")
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+# print(f"Loading NeoVerse pipeline (reconstructor: {args.reconstructor_path})...")
+# pipe = WanVideoNeoVersePipeline.from_pretrained(
+#     local_model_path="models",
+#     reconstructor_path=args.reconstructor_path,
+#     lora_path="models/NeoVerse/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",
+#     lora_alpha=1.0,
+#     device=device,
+#     torch_dtype=torch.bfloat16,
+#     enable_vram_management=args.low_vram,
+# )
+# print("Pipeline loaded.")
 
 
 def _export_scene(scene):
@@ -123,7 +123,7 @@ def handle_upload(files, scene_type):
 # ---------------------------------------------------------------------------
 # 2. Reconstruction
 # ---------------------------------------------------------------------------
-@torch.no_grad()
+# @torch.no_grad()
 def reconstruct(state):
     """Run the reconstructor and return 3D scene."""
     if state is None or "images" not in state:
@@ -234,7 +234,7 @@ def handle_traj_upload(t_file):
 # ---------------------------------------------------------------------------
 # 4. Render preview
 # ---------------------------------------------------------------------------
-@torch.no_grad()
+# @torch.no_grad()
 def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
             mode, zoom, use_ff, alpha_threshold):
     """Build trajectory then render preview.
@@ -329,7 +329,7 @@ def preview(state, selected_tab, t_file, t_type, angle, distance, orbit_r,
 # ---------------------------------------------------------------------------
 # 5. Generate final video
 # ---------------------------------------------------------------------------
-@torch.no_grad()
+# @torch.no_grad()
 def generate_final(state, prompt, negative_prompt, seed):
     """Run diffusion generation using rendered conditioning."""
     if state is None or "target_rgb" not in state:
@@ -366,7 +366,12 @@ def generate_final(state, prompt, negative_prompt, seed):
 # ---------------------------------------------------------------------------
 theme = gr.themes.Base()
 
-VALID_TYPES = sorted(CameraTrajectory.VALID_TRAJECTORY_TYPES)
+# VALID_TYPES = sorted(CameraTrajectory.VALID_TRAJECTORY_TYPES)
+VALID_TYPES = sorted([
+    "pan_left", "pan_right", "tilt_up", "tilt_down",
+    "move_left", "move_right", "push_in", "pull_out",
+    "boom_up", "boom_down", "orbit_left", "orbit_right", "static",
+])
 TAB_CAMERA_PARAMS = "tab_camera_params"
 TAB_TRAJ_FILE = "tab_traj_file"
 
