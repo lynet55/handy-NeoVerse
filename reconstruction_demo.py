@@ -53,10 +53,10 @@ print("Reconstructor loaded.")
 def reconstruct(video_path, scene_type):
     if video_path is None:
         raise gr.Error("Please upload a video first.")
-
     static = scene_type == "Static scene"
     pil_images = load_video(video_path, args.max_frames, resolution=(res_w, res_h),
                             resize_mode="center_crop", static_scene=static)
+    pil_images = pil_images[:6]
     S = len(pil_images)
 
     views = {
@@ -83,7 +83,8 @@ def reconstruct(video_path, scene_type):
     input_c2w = predictions["rendered_extrinsics"][0]   # [S, 4, 4]
     input_intrs = predictions["rendered_intrinsics"][0] # [S, 3, 3]
     input_timestamps = predictions["rendered_timestamps"][0]  # [S]
-
+    classifications = predictions["classifications"][0]
+    print(f"classifications: {type(classifications)}, {classifications.shape}")
     # --- Point cloud GLB ---
     points, colors, frame_indices = extract_point_cloud(predictions)
     scene = build_scene_glb(points, colors, frame_indices, input_c2w.cpu().numpy())
