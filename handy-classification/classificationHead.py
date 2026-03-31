@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from torch.nn import functional as F
+# from torch.nn import functional as F  # BUG: wrong F — need torchvision, not torch.nn
+from torchvision.transforms import functional as F
 from dataclasses import dataclass
+from typing import List
 import os
 
 from data import Hot3DClipsDataset
@@ -55,31 +57,46 @@ class NeoVerseReconstructor:
             self.pipe = None
 
     def reconstruct(self, image: torch.Tensor) -> torch.Tensor:
-        
+
         """
-            Placeholder for NeoVerse reconstruction logic.
+            Reconstruct scene from input image and render via GS rasterizer.
             Args:
-            image: [B, C, H, W] input egocentric image tensors
+                image: [C, H, W] single input image tensor (matches Hot3DClipsDataset output)
             Returns:
-            [B, S, token_dim] reconstructed token sequence for classification head.
+                rendered_rgb: [1, S, H, W, 3] rendered RGB from gaussian splatting
         """
         if self.pipe is None:
             raise RuntimeError("NeoVerse pipeline not available.")
 
         device = image.device
+        # image is [C, H, W] from dataset — convert to PIL for pipeline
         pil_image = F.to_pil_image(image.cpu())
 
-        state = {"images": [pil_image], "scene_type": self.cfg.SCENE_TYPE}
+        # state = {"images": [pil_image], "scene_type": self.cfg.SCENE_TYPE}  # BUG: SCENE_TYPE → scene_type
+        state = {"images": [pil_image], "scene_type": self.cfg.scene_type}
         pil_images = state["images"]
+        static_flag = self.cfg.scene_type == "Static scene"
+        S = len(pil_images)
 
         views = {
             "img": torch.stack([F.to_tensor(img)[None] for img in pil_images], dim=1).to(device),
-            "is_target": torch.zeros((1, 1), dtype=torch.bool, device=device),
+            # "is_target": torch.zeros((1, 1), dtype=torch.bool, device=device),
+            "is_target": torch.zeros((1, S), dtype=torch.bool, device=device),
         }
+        if static_flag:
+            views["is_static"] = torch.ones((1, S), dtype=torch.bool, device=device)
+            views["timestamp"] = torch.zeros((1, S), dtype=torch.int64, device=device)
+        else:
+            views["is_static"] = torch.zeros((1, S), dtype=torch.bool, device=device)
+            views["timestamp"] = torch.arange(0, S, dtype=torch.int64, device=device).unsqueeze(0)
 
-        with torch.amp.autocast("cuda", dtype=self.pipe.torch_dtype):
+        # Low-VRAM: load reconstructor to GPU before use
+        if self.pipe.vram_management_enabled:
+            self.pipe.reconstructor.to(device)
+
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=self.pipe.torch_dtype):
             predictions = self.pipe.reconstructor(views, is_inference=True, use_motion=False)
-        
+
         # Low-VRAM: offload reconstructor back to CPU
         if self.pipe.vram_management_enabled:
             self.pipe.reconstructor.cpu()
@@ -90,22 +107,42 @@ class NeoVerseReconstructor:
         input_cam2world = predictions["rendered_extrinsics"][0]     # [S, 4, 4]
         input_timestamps = predictions["rendered_timestamps"][0]    # [S]
 
-        # points, colors, frame_indices = extract_point_cloud(predictions)
+        # # points, colors, frame_indices = extract_point_cloud(predictions)
 
-        state["source_views"] = views
-        state["gaussians"] = gaussians
-        state["input_intrs"] = input_intrs
-        state["input_cam2world"] = input_cam2world
-        state["input_timestamps"] = input_timestamps
-        state["points"] = points
-        state["colors"] = colors
-        state["frame_indices"] = frame_indices
-        state["height"] = pil_images[0].size[1]
-        state["width"] = pil_images[0].size[0]
+        # state["source_views"] = views
+        # state["gaussians"] = gaussians
+        # state["input_intrs"] = input_intrs
+        # state["input_cam2world"] = input_cam2world
+        # state["input_timestamps"] = input_timestamps
+        # state["points"] = points   # BUG: referenced before assignment (extract_point_cloud was commented out)
+        # state["colors"] = colors
+        # state["frame_indices"] = frame_indices
+        # state["height"] = pil_images[0].size[1]
+        # state["width"] = pil_images[0].size[0]
 
         # # Build GLB: 11-frame point cloud, all S cameras shown
         # scene = build_scene_glb(points, colors, frame_indices, input_cam2world.cpu().numpy())
         # glb_path = _export_scene(scene)
+
+        # --- Render via GS rasterizer (see app.py:291-297) ---
+        from diffsynth.utils.auxiliary import homo_matrix_inverse
+        H, W = pil_images[0].size[1], pil_images[0].size[0]
+        target_world2cam = homo_matrix_inverse(input_cam2world)
+
+        with torch.no_grad():
+            rendered_rgb, rendered_depth, rendered_alpha = (
+                self.pipe.reconstructor.gs_renderer.rasterizer.forward(
+                    gaussians,
+                    render_viewmats=[target_world2cam],
+                    render_Ks=[input_intrs],
+                    render_timestamps=[input_timestamps],
+                    sh_degree=0,
+                    width=W,
+                    height=H,
+                )
+            )
+
+        return rendered_rgb  # [1, S, H, W, 3]
 
 
 class ClassificationHead(nn.Module):
@@ -119,7 +156,7 @@ class ClassificationHead(nn.Module):
             nn.Linear(cfg.token_dim // 2, cfg.num_classes),
         )
 
-    def forward(self, token_list: List[torch.Tensor]):
+    def forward(self, token_list: "List[torch.Tensor]"):
         tokens = token_list[-1][:, :, self.patch_start_idx:]
 
         # Normalize then pool over patches
@@ -130,7 +167,10 @@ class ClassificationHead(nn.Module):
         return self.head(pooled)
     
 
-def compute_loss(logit, gt_mask):
+# def compute_loss(logit, gt_mask):  # BUG: args unused, returns unparameterized loss
+#     return nn.CrossEntropyLoss()
+
+def get_criterion():
     return nn.CrossEntropyLoss()
 
 
@@ -159,7 +199,8 @@ def train():
     classification_model.to(cfg.device)
     classification_model.train()
 
-    criterion = compute_loss()
+    # criterion = compute_loss()  # BUG: compute_loss expected 2 args, returned unused CE
+    criterion = get_criterion()
     optimizer = cfg.optimizer(
         classification_model.parameters(),
         lr=cfg.learning_rate,
@@ -168,10 +209,13 @@ def train():
 
     for epoch in range(cfg.epochs):
         epoch_loss = 0.0
-        for batch, label in enumerate(train_loader):
+        # for batch, label in enumerate(train_loader):  # BUG: enumerate yields (int, dict), names swapped
+        for step, batch in enumerate(train_loader):
 
-            image = batch["egocentric_image"].to(cfg.device)
-            gt_mask = batch["segmented_image"].to(cfg.device)
+            # image = batch["egocentric_image"].to(cfg.device)  # BUG: wrong key, dataset uses "image"
+            # gt_mask = batch["segmented_image"].to(cfg.device)  # BUG: wrong key, dataset uses "ground_truth_image"
+            image = batch["image"].to(cfg.device)
+            gt_mask = batch["ground_truth_image"].to(cfg.device)
             neoverse_reconstruction = neoverse.reconstruct(image)
 
             optimizer.zero_grad()
@@ -182,4 +226,5 @@ def train():
 
             epoch_loss += loss.item()
 
+        # print(f"Epoch {epoch + 1}/{cfg.epochs}  loss: {epoch_loss / (step + 1):.4f}")  # BUG: 'step' was undefined
         print(f"Epoch {epoch + 1}/{cfg.epochs}  loss: {epoch_loss / (step + 1):.4f}")
