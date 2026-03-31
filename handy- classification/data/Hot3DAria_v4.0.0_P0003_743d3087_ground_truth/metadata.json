@@ -1,0 +1,31 @@
+{
+    "have_hand_object_pose_gt": true,
+    "headset": "Aria",
+    "object_bop_uids": [
+        "16",
+        "28",
+        "23",
+        "8",
+        "1",
+        "31"
+    ],
+    "object_names": [
+        "vase",
+        "keyboard",
+        "aria_small",
+        "mug_patterned",
+        "holder_black",
+        "mouse"
+    ],
+    "object_uids": [
+        "163340972252026",
+        "37787722328019",
+        "111305855142671",
+        "117658302265452",
+        "232501673989606",
+        "265826671143948"
+    ],
+    "participant_id": "P0003",
+    "recording_name": "P0003_743d3087",
+    "version": 4
+}
