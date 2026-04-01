@@ -16,6 +16,50 @@ from diffsynth.models.utils import hash_state_dict_keys
 
 
 class WorldMirror(nn.Module, PyTorchModelHubMixin):
+    
+    def initialize(self, missing_keys: list):
+        """
+        Initialize only the layers that were missing when loading a checkpoint.
+        
+        Args:
+            missing_keys (list of str): Names of parameters missing from the checkpoint
+        """
+        param_to_module = {}
+
+        for name, module in self.named_modules():
+            # Only care about modules that have weight/bias
+            if hasattr(module, "weight"):
+                param_to_module[f"{name}.weight"] = module
+            if hasattr(module, "bias") and module.bias is not None:
+                param_to_module[f"{name}.bias"] = module
+
+        for key in missing_keys:
+            module = param_to_module.get(key, None)
+            if module is None:
+                print(f"[Warning] Could not find module for missing key: {key}")
+                continue
+            
+        # Initialize weights
+            if "weight" in key:
+                if isinstance(module, nn.Conv2d) or isinstance(module, nn.ConvTranspose2d):
+
+                    print(f"conv2d init for {key}")
+                    nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                elif isinstance(module, nn.Linear):
+
+                    print(f"linear init for {key}")
+                    nn.init.xavier_uniform_(module.weight)
+                elif isinstance(module, nn.LayerNorm):
+
+                    print(f"layernorm init for {key}")
+                    nn.init.ones_(module.weight)
+            # Initialize biases
+            elif "bias" in key:
+                
+                print(f"bias init for {key}")
+                nn.init.zeros_(module.bias)
+
+
     def __init__(self,
                  img_size=518,
                  patch_size=14,
@@ -40,6 +84,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                  sampling_strategy="uniform",
                  dpt_gradient_checkpoint=False,
                  condition_strategy=["token", "pow3r", "token"],
+                 enable_hand_pred=True,
                  **kwargs):
 
         super().__init__()
@@ -66,8 +111,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         self.sampling = sampling_strategy
         self.dpt_checkpoint = dpt_gradient_checkpoint
         self.cond_methods = condition_strategy
+        self.enable_hand_pred = enable_hand_pred
         self.config = self._store_config()
-
         # Visual geometry transformer
         self.visual_geometry_transformer = VisualGeometryTransformer(
             img_size=img_size,
@@ -96,6 +141,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             "enable_depth": self.enable_depth,
             "enable_norm": self.enable_norm,
             "enable_gs": self.enable_gs,
+            "enable_hand_pred": self.enable_hand_pred,
             "patch_embed": self.patch_embed,
             "sampling_strategy": self.sampling,
             "dpt_checkpoint": self.dpt_checkpoint,
@@ -150,7 +196,13 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 patch_size=patch_size,
                 activation="inv_log+expp1",
             )
-
+        if self.enable_hand_pred: 
+            self.hand_pred_head = DPTHead(
+                dim_in = 2 * dim, 
+                output_dim= 4, 
+                patch_size=patch_size, 
+                activation="sigmoid"
+            )
         # Gaussian splatting feature head and renderer
         if self.enable_gs:
             self.gs_head = DPTHead(
@@ -173,6 +225,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 occlusion_threshold=self.occlusion_threshold,
                 bidirection=self.bidirection,
             )
+            self.gs_renderer.training = False
+
             # Dynamic Gaussian splatting attribute heads
             if self.enable_dynamic_gs_attr:
                 self.gs_fwd_attr_head = DPTHead(
@@ -277,7 +331,6 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
         fwd_token_list = context_preds.get("fwd_token_list", fwd_token_list)
         bwd_token_list = context_preds.get("bwd_token_list", bwd_token_list)
-
         # Velocity prediction
         if self.enable_motion and use_motion:
             assert len(fwd_token_list) > 0 and len(bwd_token_list) > 0
@@ -295,7 +348,14 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             preds["velocity_fwd_conf"] = vel_fwd_conf
             preds["velocity_bwd"] = vel_bwd
             preds["velocity_bwd_conf"] = vel_bwd_conf
-
+        if self.enable_hand_pred: 
+            classifications, confidences = self.hand_pred_head(
+                context_preds.get("token_list", token_list), 
+                images = context_preds.get("imgs", imgs), 
+                patch_start_idx = patch_start_idx
+            )
+            preds["seg_labels"] = classifications
+            preds["classification_confidences"] = confidences
         # 3D Gaussian Splatting
         if self.enable_gs:
             gs_feat, gs_depth, gs_depth_conf = self.gs_head(
@@ -321,7 +381,6 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 )
                 preds["gs_fwd_attr"] = gs_fwd_attr
                 preds["gs_bwd_attr"] = gs_bwd_attr
-
             preds = self.gs_renderer.render(
                 gs_feats=gs_feat,
                 images=imgs,
