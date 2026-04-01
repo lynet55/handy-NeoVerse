@@ -3,5 +3,7 @@ __pycache__
 .vscode
 .gradio
 .claude
+pyrightconfig.json
 
+/models
 /outputs
