@@ -7,3 +7,9 @@ pyrightconfig.json
 
 /models
 /outputs
+/diffsynth/data/images/*
+/diffsynth/data/masks/*
+/diffsynth/data/merged_masks/*
+/diffsynth/data/object_models/*
+/diffsynth/data/tar_recv/*
+
