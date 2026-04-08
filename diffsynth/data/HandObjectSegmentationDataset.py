@@ -5,7 +5,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 def load_image(path: Path) -> torch.Tensor:
-    img = np.array(Image.open(path).convert("RGB"))
+    img = np.array(Image.open(path).convert("RGB").resize((560, 336)))
     return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
 def load_binary_mask(path: Path, shape) -> torch.Tensor:
@@ -20,8 +20,8 @@ def load_binary_mask(path: Path, shape) -> torch.Tensor:
     return torch.from_numpy(mask)
 
 class HandObjectSegmentationDataset(torch.utils.data.Dataset):
-    def __init__(self, image_root, mask_root, stream="stream1201-1"):
-        self.image_root = Path(image_root) / stream
+    def __init__(self, image_root="diffsynth/data/images/", mask_root="diffsynth/data/merged_masks/", stream="stream1201-1"):
+        self.image_root = Path(image_root +  stream)
         self.mask_root = Path(mask_root)
         self.stream = stream
 
@@ -84,7 +84,7 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
 
         background = ~(right | left | obj)
 
-        target_mask = torch.stack([right, left, obj, background], dim=0)
+        target_mask = torch.stack([right, left, obj, background], dim=0).float()
 
         ## Merge into class-index tensor
         #target = torch.zeros((H, W), dtype=torch.long)
@@ -94,31 +94,21 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
 
         return image, target_mask
 
-dataset = HandObjectSegmentationDataset(
-    image_root="images",
-    mask_root="merged_masks",
-    stream="stream1201-2",
-)
+dataset = HandObjectSegmentationDataset()
 
 image, target = dataset[0]
-print(image.shape)
-print(target.shape)
-print(len(dataset))
-assert target.dtype == torch.bool
+#print(image.shape)
+#print(target.shape)
+#print(len(dataset))
+assert target.dtype == torch.float
 assert image.shape[0] == 3
 assert target.shape[0] == 4
 
 
 dataloader = DataLoader(
     dataset,
-    batch_size=4,
-    shuffle=True,
+    batch_size=10,
+    shuffle=False,
     num_workers=4,
     pin_memory=False,
 )
-
-
-for images, targets in dataloader:
-    print(images.shape, targets.shape)
-    break
-
