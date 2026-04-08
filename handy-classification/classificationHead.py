@@ -36,7 +36,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     #neoverse
-    reconstruction_model_path = ""
+    reconstruction_model_path = "models/NeoVerse/reconstructor.ckpt"
     low_vram = True
     scene_type = "Static scene"
 
