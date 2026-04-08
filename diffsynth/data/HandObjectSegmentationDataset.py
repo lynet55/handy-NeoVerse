@@ -9,10 +9,15 @@ def load_image(path: Path) -> torch.Tensor:
     return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
 def load_binary_mask(path: Path, shape) -> torch.Tensor:
+    H, W = shape
     if path is None or not path.exists():
-        return torch.zeros(shape, dtype=torch.bool)
-    mask = np.array(Image.open(path).convert("L"))
-    return torch.from_numpy(mask > 0)
+        return torch.zeros((H,W), dtype=torch.bool)
+    #mask = np.array(Image.open(path).convert("L"))
+    mask = Image.open(path).convert("L")
+    if mask.size != (W, H):
+        mask = mask.resize((W, H), resample=Image.NEAREST)
+    mask = np.array(mask) > 0
+    return torch.from_numpy(mask)
 
 class HandObjectSegmentationDataset(torch.utils.data.Dataset):
     def __init__(self, image_root, mask_root, stream="stream1201-1"):
@@ -75,6 +80,8 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
         right = load_binary_mask(sample.get("right"), (H, W))
         left  = load_binary_mask(sample.get("left"),  (H, W))
         obj   = load_binary_mask(sample.get("object"),(H, W))
+        assert right.shape == left.shape == obj.shape == (H, W)
+
         background = ~(right | left | obj)
 
         target_mask = torch.stack([right, left, obj, background], dim=0)
@@ -85,11 +92,11 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
         #target[left]  = 2
         #target[obj]   = 3
 
-        return image, target
+        return image, target_mask
 
 dataset = HandObjectSegmentationDataset(
-    image_root="testing/images",
-    mask_root="testing/masks",
+    image_root="images",
+    mask_root="merged_masks",
     stream="stream1201-2",
 )
 
@@ -97,8 +104,9 @@ image, target = dataset[0]
 print(image.shape)
 print(target.shape)
 print(len(dataset))
-assert target.dtype == torch.long
+assert target.dtype == torch.bool
 assert image.shape[0] == 3
+assert target.shape[0] == 4
 
 
 dataloader = DataLoader(
