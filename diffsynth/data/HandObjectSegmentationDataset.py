@@ -75,12 +75,15 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
         right = load_binary_mask(sample.get("right"), (H, W))
         left  = load_binary_mask(sample.get("left"),  (H, W))
         obj   = load_binary_mask(sample.get("object"),(H, W))
+        background = ~(right | left | obj)
 
-        # Merge into class-index tensor
-        target = torch.zeros((H, W), dtype=torch.long)
-        target[right] = 1
-        target[left]  = 2
-        target[obj]   = 3
+        target_mask = torch.stack([right, left, obj, background], dim=0)
+
+        ## Merge into class-index tensor
+        #target = torch.zeros((H, W), dtype=torch.long)
+        #target[right] = 1
+        #target[left]  = 2
+        #target[obj]   = 3
 
         return image, target
 
