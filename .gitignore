@@ -12,4 +12,5 @@ pyrightconfig.json
 /diffsynth/data/merged_masks/*
 /diffsynth/data/object_models/*
 /diffsynth/data/tar_recv/*
-
+/diffsynth/data/training_masks/*
+/diffsynth/data/training_images/*
