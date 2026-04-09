@@ -14,3 +14,4 @@ pyrightconfig.json
 /diffsynth/data/tar_recv/*
 /diffsynth/data/training_masks/*
 /diffsynth/data/training_images/*
+/diffsynth/data/mano/*
