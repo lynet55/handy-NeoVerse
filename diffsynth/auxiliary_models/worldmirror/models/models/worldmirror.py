@@ -201,7 +201,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 dim_in = 2 * dim, 
                 output_dim= 4, 
                 patch_size=patch_size, 
-                activation="sigmoid+none"
+                activation="linear+none"
             )
         # Gaussian splatting feature head and renderer
         if self.enable_gs:

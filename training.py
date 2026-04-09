@@ -2,13 +2,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as TF
-import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import List
 import numpy as np
 from PIL import Image
 import os
-from torchvision.transforms import functional as F 
+
 from diffsynth.data import dataloader 
 from diffsynth.auxiliary_models.worldmirror.models.heads.dense_head import DPTHead
 from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
@@ -43,7 +42,7 @@ class TrainConfig:
     save_model_path_prefix = "model/NeoVerse/reconstructor"
     save_model_path_suffix = "/.ckpt"
     low_vram = False
-    scene_type = "Static scene"
+    scene_type = "static_scene"
 
 
 class NeoVerseReconstructor:
@@ -81,7 +80,7 @@ class NeoVerseReconstructor:
         S = len(images)
         static = self.cfg.scene_type == "static_scene"
         views = {
-        "img": images.unsqueeze(0).to(self.cfg.device),
+        "img": images.unsqueeze(0).to(self.cfg.device, non_blocking=True),
         "is_target": torch.zeros((1, S), dtype=torch.bool, device=self.cfg.device),
         "is_static": torch.ones((1, S), dtype=torch.bool, device=self.cfg.device) if static
                      else torch.zeros((1, S), dtype=torch.bool, device=self.cfg.device),
@@ -94,7 +93,7 @@ class NeoVerseReconstructor:
 
         try:
             with torch.amp.autocast(self.cfg.device, dtype=torch.bfloat16):
-                predictions = self.reconstructor(views, is_inference=True, use_motion=False)
+                predictions = self.reconstructor(views, is_inference=False, use_motion=False)
         finally:
             if self.cfg.low_vram:
                 self.reconstructor.to("cpu")
@@ -138,9 +137,10 @@ def train():
         epoch_loss = 0.0
         for step, (images, gt_mask) in enumerate(dataloader):
             pred_rgb, pred_alpha, classifications = worldmirror.reconstruct(images)
-            if cfg.device == "cuda": 
-                gt_mask = gt_mask.to("cuda")
-            loss = criterion(classifications, gt_mask)
+            if cfg.device == "cuda":
+                gt_mask = gt_mask.to("cuda", non_blocking=True)
+            loss = criterion(classifications, gt_mask.argmax(dim=1).long())
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
