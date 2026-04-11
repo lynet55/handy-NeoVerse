@@ -1,5 +1,9 @@
-conda create -n neoverse python=3.10 -y
-conda activate neoverse
+# conda create -n neoverse python=3.10 -y
+# conda activate neoverse
+
+#normal python venv for stud-cluster
+source ./neoverse/bin/activate 
+
 pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.1+cu128.html
