@@ -8,6 +8,7 @@ import clip_util
 import imageio
 import numpy as np
 from PIL import Image
+from pathlib import Path
 
 # Target size for saved images and masks. Set to None to skip resizing.
 OUTPUT_SIZE: Optional[tuple] = (280, 280)  # (width, height)
@@ -15,7 +16,7 @@ OUTPUT_SIZE: Optional[tuple] = (280, 280)  # (width, height)
 # Directory where sentinel files are written to signal a clip is fully processed.
 # The dataset watches this directory before ingesting a clip.
 SENTINEL_DIR = "./diffsynth/data/ready_sentinels/"
-
+TAR_DIR = Path("diffsynth/data/tar_recv")
 
 def resize_image(arr: np.ndarray, size: Optional[tuple], is_mask: bool = False) -> np.ndarray:
     """Resize a numpy image array to `size` (width, height).
@@ -41,6 +42,13 @@ def mark_clip_ready(clip_name: str, sentinel_dir: str) -> None:
     sentinel_path = os.path.join(sentinel_dir, f"{clip_name}.ready")
     open(sentinel_path, "w").close()
     print(f"Sentinel written: {sentinel_path}")
+
+def delete_tar(clip_name: str) -> None:
+    print(clip_name)
+    tar_path = TAR_DIR / f"{clip_name}.tar"
+    if tar_path.exists():
+        tar_path.unlink()
+        print(f"Deleted: {tar_path}")
 
 
 def process_clip(
@@ -148,6 +156,7 @@ def process_clip(
     # All frames written — signal to the dataset that this clip is safe to ingest.
     if sentinel_dir is not None:
         mark_clip_ready(clip_name, sentinel_dir)
+    delete_tar(clip_name=clip_name)
 
 
 def main() -> None:
@@ -167,7 +176,7 @@ def main() -> None:
     mano_model = MANOHandModel(mano_model_dir) if hand_type == "mano" else None
 
     processed_clips = set()
-    download_index = 1286
+    
     more_available = True
 
     print("Starting download+process loop...")
