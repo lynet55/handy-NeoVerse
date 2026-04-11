@@ -1,54 +1,103 @@
+import shutil
+import time
+from collections import defaultdict
 from pathlib import Path
-from PIL import Image
-import torch
+
 import numpy as np
-from torch.utils.data import DataLoader
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Sampler
+
+TAR_DIR = Path("diffsynth/data/tars")  # adjust if needed
+SENTINEL_DIR = Path("diffsynth/data/ready_sentinels/")
+
+STREAMS = ["stream1201-1", "stream1201-2"]
+
 
 def load_image(path: Path) -> torch.Tensor:
-    img = np.array(Image.open(path).convert("RGB").resize((560, 336)))
+    img = np.array(Image.open(path).convert("RGB"))
     return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
 
 def load_binary_mask(path: Path, shape) -> torch.Tensor:
     H, W = shape
     if path is None or not path.exists():
-        return torch.zeros((H,W), dtype=torch.bool)
-    #mask = np.array(Image.open(path).convert("L"))
+        return torch.zeros((H, W), dtype=torch.bool)
     mask = Image.open(path).convert("L")
     if mask.size != (W, H):
         mask = mask.resize((W, H), resample=Image.NEAREST)
     mask = np.array(mask) > 0
     return torch.from_numpy(mask)
 
-class HandObjectSegmentationDataset(torch.utils.data.Dataset):
-    def __init__(self, image_root="diffsynth/data/images/", mask_root="diffsynth/data/merged_masks/", stream="stream1201-1"):
-        self.image_root = Path(image_root +  stream)
-        self.mask_root = Path(mask_root)
-        self.stream = stream
 
-        self.samples = []
+def delete_clip(
+    clip_name: str,
+    image_root_base: Path,
+    mask_root: Path,
+    streams: list[str],
+    sentinel_dir: Path,
+) -> None:
+    """Delete all data for a finished clip once ALL streams are done:
+    image folders for every stream, the shared mask folder, the tar file,
+    and the sentinel file."""
+    for stream in streams:
+        image_clip_dir = image_root_base / stream / clip_name
+        if image_clip_dir.exists():
+            shutil.rmtree(image_clip_dir)
+            print(f"Deleted: {image_clip_dir}")
+
+    mask_clip_dir = mask_root / clip_name
+    if mask_clip_dir.exists():
+        shutil.rmtree(mask_clip_dir)
+        print(f"Deleted: {mask_clip_dir}")
+
+    tar_path = TAR_DIR / f"{clip_name}.tar"
+    if tar_path.exists():
+        tar_path.unlink()
+        print(f"Deleted: {tar_path}")
+
+    sentinel_path = sentinel_dir / f"{clip_name}.ready"
+    if sentinel_path.exists():
+        sentinel_path.unlink()
+        print(f"Deleted: {sentinel_path}")
+
+
+class HandObjectSegmentationDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        image_root: str = "diffsynth/data/training_images/",
+        mask_root: str = "diffsynth/data/training_masks/",
+        sentinel_dir: str = str(SENTINEL_DIR),
+        streams: list[str] = None,
+    ):
+        self.image_root_base = Path(image_root)
+        self.mask_root = Path(mask_root)
+        self.sentinel_dir = Path(sentinel_dir)
+        self.streams = streams or STREAMS
+
+        self.samples: list[dict] = []
+        # key: clip_name  ->  total frames across ALL streams
+        self.clip_frame_counts: dict[str, int] = defaultdict(int)
+        # Tracks which clips have already been indexed so we never double-count.
+        self._indexed_clips: set[str] = set()
+
         self._build_index()
 
-    def _build_index(self):
-        """
-        Builds a list of (image_path, mask_paths) entries.
-        """
-        for clip_dir in sorted(self.image_root.iterdir()):
-            if not clip_dir.is_dir():
+    def _index_clip(self, clip_name: str) -> None:
+        """Index all frames for a single clip across all streams and append
+        them to self.samples.  Safe to call only once per clip."""
+        for stream in self.streams:
+            clip_dir = self.image_root_base / stream / clip_name
+            if not clip_dir.exists():
                 continue
 
-            clip_name  = clip_dir.name
             mask_clip_dir = self.mask_root / clip_name
-
             if not mask_clip_dir.exists():
                 continue
 
-            # index masks by frame
-            masks_by_frame = {}
-
-        
-            for p in mask_clip_dir.glob(f"*_{self.stream}_*.png"):
+            masks_by_frame: dict[str, dict] = {}
+            for p in mask_clip_dir.glob(f"*_{stream}_*.png"):
                 frame_id = p.name.split("_")[0]
-
                 masks_by_frame.setdefault(frame_id, {})
                 if "hand_LEFT" in p.name:
                     masks_by_frame[frame_id]["left"] = p
@@ -57,21 +106,53 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
                 elif "object" in p.name:
                     masks_by_frame[frame_id]["object"] = p
 
-            # match images to masks
             for img_path in sorted(clip_dir.glob("*.png")):
                 frame_id = img_path.stem
                 if frame_id not in masks_by_frame:
                     continue
 
-                self.samples.append({
-                    "image": img_path,
-                    **masks_by_frame[frame_id]
-                })
+                self.samples.append(
+                    {
+                        "image": img_path,
+                        "clip_name": clip_name,
+                        "stream": stream,
+                        **masks_by_frame[frame_id],
+                    }
+                )
+                self.clip_frame_counts[clip_name] += 1
 
-    def __len__(self):
+    def _build_index(self) -> None:
+        """Index all clips that already have a sentinel file at startup."""
+        for sentinel in sorted(self.sentinel_dir.glob("*.ready")):
+            clip_name = sentinel.stem
+            if clip_name not in self._indexed_clips:
+                self._index_clip(clip_name)
+                self._indexed_clips.add(clip_name)
+
+    def poll_for_new_clips(self) -> list[str]:
+        """Scan the sentinel directory and index any clips that have finished
+        processing since the last call.  Returns the list of newly added clip names.
+
+        Call this between epochs from the main process — NOT inside __getitem__,
+        to avoid races with DataLoader workers.
+        """
+        new_clips = []
+        for sentinel in sorted(self.sentinel_dir.glob("*.ready")):
+            clip_name = sentinel.stem
+            if clip_name not in self._indexed_clips:
+                self._index_clip(clip_name)
+                self._indexed_clips.add(clip_name)
+                new_clips.append(clip_name)
+                print(
+                    f"Dataset: ingested new clip '{clip_name}' "
+                    f"({self.clip_frame_counts[clip_name]} frames across all streams)"
+                )
+        return new_clips
+
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         sample = self.samples[idx]
 
         image = load_image(sample["image"])
@@ -79,36 +160,134 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
 
         right = load_binary_mask(sample.get("right"), (H, W))
         left  = load_binary_mask(sample.get("left"),  (H, W))
-        obj   = load_binary_mask(sample.get("object"),(H, W))
+        obj   = load_binary_mask(sample.get("object"), (H, W))
         assert right.shape == left.shape == obj.shape == (H, W)
 
         background = ~(right | left | obj)
-
         target_mask = torch.stack([right, left, obj, background], dim=0).float()
 
-        ## Merge into class-index tensor
-        #target = torch.zeros((H, W), dtype=torch.long)
-        #target[right] = 1
-        #target[left]  = 2
-        #target[obj]   = 3
-
-        return image, target_mask
-
-dataset = HandObjectSegmentationDataset()
-
-image, target = dataset[0]
-#print(image.shape)
-#print(target.shape)
-#print(len(dataset))
-assert target.dtype == torch.float
-assert image.shape[0] == 3
-assert target.shape[0] == 4
+        return image, target_mask, sample["clip_name"]
 
 
-dataloader = DataLoader(
-    dataset,
-    batch_size=10,
-    shuffle=False,
-    num_workers=4,
-    pin_memory=False,
-)
+class ClipStreamSampler(Sampler):
+    """Yields indices so that all frames of one (clip, stream) pair are
+    emitted consecutively and in ascending frame order before the next pair.
+
+    Pass ``shuffle_clips=True`` to randomise pair order while keeping
+    within-pair frame order intact.
+    """
+
+    def __init__(self, dataset: HandObjectSegmentationDataset, shuffle_clips: bool = False):
+        self.dataset = dataset
+        self.shuffle_clips = shuffle_clips
+
+        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for idx, sample in enumerate(dataset.samples):
+            groups[(sample["clip_name"], sample["stream"])].append(idx)
+
+        self._groups: list[list[int]] = list(groups.values())
+
+    def __iter__(self):
+        groups = self._groups
+        if self.shuffle_clips:
+            order = torch.randperm(len(groups)).tolist()
+            groups = [groups[i] for i in order]
+        for group in groups:
+            yield from group
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+
+def dataloader_with_cleanup(
+    dataset: HandObjectSegmentationDataset,
+    shuffle_clips: bool = False,
+    poll_new_clips: bool = False,
+    poll_interval_s: float = 30.0,
+    **dataloader_kwargs,
+):
+    """Wrap a DataLoader and delete each clip's data once ALL streams have been
+    fully yielded.  Optionally polls for newly processed clips between epochs.
+
+    Args:
+        dataset:          A HandObjectSegmentationDataset instance.
+        shuffle_clips:    Randomise (clip, stream) pair order while keeping
+                          within-pair frame order intact.
+        poll_new_clips:   If True, call dataset.poll_for_new_clips() after each
+                          full pass and wait for at least one new clip before
+                          starting the next epoch.  Use when extract_training_data
+                          is running concurrently.
+        poll_interval_s:  Seconds between polls when no new clip has arrived
+                          (only relevant when poll_new_clips=True).
+
+    Yields:
+        (image, target_mask) batches — same as iterating the DataLoader directly.
+    """
+    for forbidden in ("sampler", "batch_sampler", "shuffle"):
+        if forbidden in dataloader_kwargs:
+            raise ValueError(
+                f"Do not pass '{forbidden}' to dataloader_with_cleanup; "
+                "ordering is managed by ClipStreamSampler."
+            )
+
+    # Wait until at least one clip is ready before starting the first epoch.
+    if len(dataset) == 0:
+        print("No clips available yet. Waiting for the first clip...")
+        while len(dataset) == 0:
+            time.sleep(poll_interval_s)
+            dataset.poll_for_new_clips()
+        print(f"First clip ready — starting training ({len(dataset)} frames).")
+
+    while True:
+        sampler = ClipStreamSampler(dataset, shuffle_clips=shuffle_clips)
+        loader = DataLoader(dataset, sampler=sampler, **dataloader_kwargs)
+        seen_counts: dict[str, int] = defaultdict(int)
+
+        for image, target_mask, clip_names in loader:
+            for clip_name in clip_names:
+                seen_counts[clip_name] += 1
+                if seen_counts[clip_name] == dataset.clip_frame_counts[clip_name]:
+                    delete_clip(
+                        clip_name,
+                        dataset.image_root_base,
+                        dataset.mask_root,
+                        dataset.streams,
+                        dataset.sentinel_dir,
+                    )
+                    del seen_counts[clip_name]
+
+            yield image, target_mask
+
+        if not poll_new_clips:
+            break
+
+        # End of epoch: wait until at least one new clip is ready.
+        print("Epoch complete. Waiting for new clips from extractor...")
+        while True:
+            if (dataset.sentinel_dir / "ALL_DONE").exists():
+                print("Extractor finished. No more clips will arrive.")
+                return # TODO what should it do when no more clips are available:
+            new_clips = dataset.poll_for_new_clips()
+            if new_clips:
+                print(f"Starting new epoch with {len(new_clips)} new clip(s): {new_clips}")
+                break
+            time.sleep(poll_interval_s)
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke-test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    dataset = HandObjectSegmentationDataset()
+
+    if len(dataset) == 0:
+        print("No ready clips found yet — waiting for a sentinel...")
+        while len(dataset) == 0:
+            time.sleep(5)
+            dataset.poll_for_new_clips()
+
+    image, target, clip_name = dataset[0]
+    assert target.dtype == torch.float
+    assert image.shape[0] == 3
+    assert target.shape[0] == 4
+    print(f"OK — {len(dataset)} samples, first clip: {clip_name}")
