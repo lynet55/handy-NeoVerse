@@ -167,7 +167,7 @@ def main() -> None:
     mano_model = MANOHandModel(mano_model_dir) if hand_type == "mano" else None
 
     processed_clips = set()
-    download_index = 1287
+    download_index = 1286
     more_available = True
 
     print("Starting download+process loop...")

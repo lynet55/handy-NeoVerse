@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Sampler
 
-TAR_DIR = Path("diffsynth/data/tars")  # adjust if needed
+TAR_DIR = Path("diffsynth/data/tar_recv")  # adjust if needed
 SENTINEL_DIR = Path("diffsynth/data/ready_sentinels/")
 
 STREAMS = ["stream1201-1", "stream1201-2"]
@@ -76,8 +76,6 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
         self.streams = streams or STREAMS
 
         self.samples: list[dict] = []
-        # key: clip_name  ->  total frames across ALL streams
-        self.clip_frame_counts: dict[str, int] = defaultdict(int)
         # Tracks which clips have already been indexed so we never double-count.
         self._indexed_clips: set[str] = set()
 
@@ -85,7 +83,7 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
 
     def _index_clip(self, clip_name: str) -> None:
         """Index all frames for a single clip across all streams and append
-        them to self.samples.  Safe to call only once per clip."""
+        them to self.samples. Safe to call only once per clip."""
         for stream in self.streams:
             clip_dir = self.image_root_base / stream / clip_name
             if not clip_dir.exists():
@@ -119,7 +117,15 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
                         **masks_by_frame[frame_id],
                     }
                 )
-                self.clip_frame_counts[clip_name] += 1
+
+    def remove_clips(self, clip_names: list[str]) -> None:
+        """Remove all samples for the given clips from self.samples.
+        Only call this AFTER the DataLoader epoch has finished iterating,
+        never while a loader is still active — the sampler's pre-computed
+        indices would go out of range if the list shrinks mid-epoch."""
+        clip_set = set(clip_names)
+        self.samples = [s for s in self.samples if s["clip_name"] not in clip_set]
+        self._indexed_clips -= clip_set
 
     def _build_index(self) -> None:
         """Index all clips that already have a sentinel file at startup."""
@@ -131,7 +137,7 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
 
     def poll_for_new_clips(self) -> list[str]:
         """Scan the sentinel directory and index any clips that have finished
-        processing since the last call.  Returns the list of newly added clip names.
+        processing since the last call. Returns the list of newly added clip names.
 
         Call this between epochs from the main process — NOT inside __getitem__,
         to avoid races with DataLoader workers.
@@ -143,10 +149,7 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
                 self._index_clip(clip_name)
                 self._indexed_clips.add(clip_name)
                 new_clips.append(clip_name)
-                print(
-                    f"Dataset: ingested new clip '{clip_name}' "
-                    f"({self.clip_frame_counts[clip_name]} frames across all streams)"
-                )
+                print(f"Dataset: ingested new clip '{clip_name}'")
         return new_clips
 
     def __len__(self) -> int:
@@ -166,7 +169,7 @@ class HandObjectSegmentationDataset(torch.utils.data.Dataset):
         background = ~(right | left | obj)
         target_mask = torch.stack([right, left, obj, background], dim=0).float()
 
-        return image, target_mask, sample["clip_name"]
+        return image, target_mask, sample["clip_name"], sample["stream"]
 
 
 class ClipStreamSampler(Sampler):
@@ -207,7 +210,7 @@ def dataloader_with_cleanup(
     **dataloader_kwargs,
 ):
     """Wrap a DataLoader and delete each clip's data once ALL streams have been
-    fully yielded.  Optionally polls for newly processed clips between epochs.
+    fully yielded. Optionally polls for newly processed clips between epochs.
 
     Args:
         dataset:          A HandObjectSegmentationDataset instance.
@@ -215,7 +218,7 @@ def dataloader_with_cleanup(
                           within-pair frame order intact.
         poll_new_clips:   If True, call dataset.poll_for_new_clips() after each
                           full pass and wait for at least one new clip before
-                          starting the next epoch.  Use when extract_training_data
+                          starting the next epoch. Use when extract_training_data
                           is running concurrently.
         poll_interval_s:  Seconds between polls when no new clip has arrived
                           (only relevant when poll_new_clips=True).
@@ -239,38 +242,68 @@ def dataloader_with_cleanup(
         print(f"First clip ready — starting training ({len(dataset)} frames).")
 
     while True:
+        # Snapshot per-(clip, stream) frame counts from the current sample list.
+        # Built once per epoch so counts are stable while the loader runs.
+        pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+        for sample in dataset.samples:
+            pair_counts[(sample["clip_name"], sample["stream"])] += 1
+
+        # How many frames seen so far for each (clip, stream) pair.
+        seen_pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+        # How many streams are still pending per clip.
+        streams_remaining: dict[str, int] = defaultdict(int)
+        for (clip_name, _stream) in pair_counts:
+            streams_remaining[clip_name] += 1
+
         sampler = ClipStreamSampler(dataset, shuffle_clips=shuffle_clips)
         loader = DataLoader(dataset, sampler=sampler, **dataloader_kwargs)
-        seen_counts: dict[str, int] = defaultdict(int)
 
-        for image, target_mask, clip_names in loader:
-            for clip_name in clip_names:
-                seen_counts[clip_name] += 1
-                if seen_counts[clip_name] == dataset.clip_frame_counts[clip_name]:
-                    delete_clip(
-                        clip_name,
-                        dataset.image_root_base,
-                        dataset.mask_root,
-                        dataset.streams,
-                        dataset.sentinel_dir,
-                    )
-                    del seen_counts[clip_name]
+        # Clips fully consumed this epoch — deleted from disk but not yet
+        # removed from dataset.samples (that would shift indices mid-epoch).
+        clips_to_remove: list[str] = []
+
+        for image, target_mask, clip_names, stream_names in loader:
+            for clip_name, stream in zip(clip_names, stream_names):
+                key = (clip_name, stream)
+                seen_pair_counts[key] += 1
+                if seen_pair_counts[key] == pair_counts[key]:
+                    del seen_pair_counts[key]
+                    streams_remaining[clip_name] -= 1
+                    if streams_remaining[clip_name] == 0:
+                        # Files can be deleted immediately — we won't read
+                        # them again this epoch since the sampler is
+                        # contiguous and this stream group is exhausted.
+                        delete_clip(
+                            clip_name,
+                            dataset.image_root_base,
+                            dataset.mask_root,
+                            dataset.streams,
+                            dataset.sentinel_dir,
+                        )
+                        clips_to_remove.append(clip_name)
+                        del streams_remaining[clip_name]
 
             yield image, target_mask
+
+        # Epoch complete — now safe to remove consumed entries from the sample
+        # list. The old sampler and loader are done so no indices are live.
+        if clips_to_remove:
+            dataset.remove_clips(clips_to_remove)
 
         if not poll_new_clips:
             break
 
-        # End of epoch: wait until at least one new clip is ready.
+        # End of epoch: wait until at least one new clip is ready, or stop if
+        # the extractor is done and no further clips will ever arrive.
         print("Epoch complete. Waiting for new clips from extractor...")
         while True:
-            if (dataset.sentinel_dir / "ALL_DONE").exists():
-                print("Extractor finished. No more clips will arrive.")
-                return # TODO what should it do when no more clips are available:
             new_clips = dataset.poll_for_new_clips()
             if new_clips:
                 print(f"Starting new epoch with {len(new_clips)} new clip(s): {new_clips}")
                 break
+            if (dataset.sentinel_dir / "ALL_DONE").exists():
+                print("Extractor finished and no more clips are pending. Done.")
+                return
             time.sleep(poll_interval_s)
 
 
@@ -279,15 +312,16 @@ def dataloader_with_cleanup(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     dataset = HandObjectSegmentationDataset()
-
-    if len(dataset) == 0:
-        print("No ready clips found yet — waiting for a sentinel...")
-        while len(dataset) == 0:
-            time.sleep(5)
-            dataset.poll_for_new_clips()
-
-    image, target, clip_name = dataset[0]
-    assert target.dtype == torch.float
-    assert image.shape[0] == 3
-    assert target.shape[0] == 4
-    print(f"OK — {len(dataset)} samples, first clip: {clip_name}")
+    dataloader = dataloader_with_cleanup(
+        dataset,
+        shuffle_clips=False,
+        poll_new_clips=True,
+        poll_interval_s=30,
+        batch_size=10,
+    )
+    i = 0
+    for step, (images, gt_mask) in enumerate(dataloader):
+        #if not i % 10:
+        print(f"Batch number: {i} iterated")
+        i += 1
+        time.sleep(0.1)
