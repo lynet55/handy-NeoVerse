@@ -26,10 +26,10 @@ class TrainConfig:
     patch_start_idx: int = 5  # 1 camera token + 4 register tokens
 
     # Training Hyperparameters
-    batch_size: int = 10 #smoke test
+    batch_size: int = 10
     num_frames: int = 4
-    epochs: int = 5
-    learning_rate: float = 1e-4
+    epochs: int = 15
+    learning_rate: float = 3e-4
     weight_decay: float = 0.01
 
     # Optimizer
@@ -131,8 +131,8 @@ def train():
                                             mask_root='diffsynth/data/training_masks/'
                                             )
     
-    sampler = ClipStreamSampler(dataset, shuffle_clips=False)
-    dataloader = DataLoader(dataset, sampler=sampler, batch_size=10, num_workers=0)
+    sampler = ClipStreamSampler(dataset, shuffle_clips=True)
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=cfg.batch_size, num_workers=4)
 
     criterion = get_criterion()
 
@@ -144,7 +144,7 @@ def train():
 
     for epoch in range(cfg.epochs):
         epoch_loss = 0.0
-        for step, (images, gt_mask) in enumerate(dataloader):
+        for step, (images, gt_mask, _, _) in enumerate(dataloader):
             pred_rgb, pred_alpha, classifications = worldmirror.reconstruct(images)
             if cfg.device == "cuda":
                 gt_mask = gt_mask.to("cuda", non_blocking=True)
