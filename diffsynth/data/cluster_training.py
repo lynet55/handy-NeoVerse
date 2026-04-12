@@ -8,13 +8,12 @@ import numpy as np
 from PIL import Image
 import os
 
-from diffsynth.data import dataloader 
 from diffsynth.auxiliary_models.worldmirror.models.heads.dense_head import DPTHead
 from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
 from diffsynth.models.model_manager import ModelManager
-from diffsynth.utils.auxiliary import load_video, homo_matrix_inverse
+from diffsynth.utils.auxiliary import homo_matrix_inverse
 
-from SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
+from .SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
 
 @dataclass
 class TrainConfig:
@@ -129,29 +128,11 @@ def train():
     worldmirror = NeoVerseReconstructor(cfg)
 
     dataset = HandObjectSegmentationDataset(image_root='diffsynth/data/training_images/',
-                                            mask_root='diffsynth/data/training_masks/',
-                                            sentinel_dir='diffsynth/data/ready_sentinels/'
+                                            mask_root='diffsynth/data/training_masks/'
                                             )
     
     sampler = ClipStreamSampler(dataset, shuffle_clips=False)
     dataloader = DataLoader(dataset, sampler=sampler, batch_size=10, num_workers=0)
-
-    #dataloader = dataloader_with_cleanup(
-    #    dataset,
-    #    shuffle_clips=False,
-    #     poll_new_clips=False, #set to True in prod
-    #     poll_interval_s=30,
-    #     batch_size=10,
-    # )
-
-    # dataloader = DataLoader(
-    #     dataset,
-    #     batch_size=cfg.batch_size,
-    #     shuffle=False,
-    #     num_workers=8,
-    #     pin_memory=True,
-    #     prefetch_factor=2
-    # )
 
     criterion = get_criterion()
 
@@ -175,7 +156,6 @@ def train():
             epoch_loss += loss.item()
 
         print(f"Epoch {epoch + 1}/{cfg.epochs}  loss: {epoch_loss / (step + 1):.4f}")
-        return "runs on cluster" #TODO: remove
 
 if __name__ == "__main__":
     train()

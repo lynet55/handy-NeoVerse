@@ -135,7 +135,7 @@ def train():
 
     for epoch in range(cfg.epochs):
         epoch_loss = 0.0
-        for step, (images, gt_mask) in enumerate(dataloader):
+        for step, (images, gt_mask, _, _) in enumerate(dataloader):
             pred_rgb, pred_alpha, classifications = worldmirror.reconstruct(images)
             if cfg.device == "cuda":
                 gt_mask = gt_mask.to("cuda", non_blocking=True)
