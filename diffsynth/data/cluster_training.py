@@ -14,9 +14,7 @@ from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import Wor
 from diffsynth.models.model_manager import ModelManager
 from diffsynth.utils.auxiliary import load_video, homo_matrix_inverse
 
-
-import HandObjectSegmentationDataset 
-from HandObjectSegmentationDataset import dataloader_with_cleanup
+from SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
 
 @dataclass
 class TrainConfig:
@@ -134,6 +132,10 @@ def train():
                                             mask_root='diffsynth/data/training_masks/',
                                             sentinel_dir='diffsynth/data/ready_sentinels/'
                                             )
+    
+    sampler = ClipStreamSampler(dataset, shuffle_clips=False)
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=10, num_workers=0)
+
     #dataloader = dataloader_with_cleanup(
     #    dataset,
     #    shuffle_clips=False,
@@ -142,14 +144,14 @@ def train():
     #     batch_size=10,
     # )
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        prefetch_factor=2
-    )
+    # dataloader = DataLoader(
+    #     dataset,
+    #     batch_size=cfg.batch_size,
+    #     shuffle=False,
+    #     num_workers=8,
+    #     pin_memory=True,
+    #     prefetch_factor=2
+    # )
 
     criterion = get_criterion()
 
