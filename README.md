@@ -238,6 +238,65 @@ python inference.py \
 python app.py --reconstructor_path models/da3_giant_1.1.safetensors
 ```
 
+## Training on a Cluster
+
+### Launch Training
+
+```bash
+python -m diffsynth.data.cluster_training
+```
+
+Training logs are written to `runs/neoverse_seg/` via TensorBoard. Checkpoints are saved to `models/NeoVerse/` (`reconstructor_latest.ckpt` and `reconstructor_best.ckpt`).
+
+### Monitoring with TensorBoard
+
+**Option 1 — SSH tunnel (recommended for clusters without open ports):**
+
+On your local machine, open a tunnel to the cluster node running the job:
+
+```bash
+ssh -N -L 6006:localhost:6006 <user>@<cluster-host>
+```
+
+Then on the cluster node (or inside your SLURM job):
+
+```bash
+tensorboard --logdir runs/neoverse_seg --port 6006 --bind_all
+```
+
+Open `http://localhost:6006` in your local browser.
+
+**Option 2 — SLURM interactive / srun:**
+
+If the cluster allows direct port access, start TensorBoard alongside your job:
+
+```bash
+srun --job-name=tb --ntasks=1 --cpus-per-task=2 \
+    tensorboard --logdir runs/neoverse_seg --port 6006 --bind_all &
+```
+
+Then SSH-tunnel to the allocated node as above.
+
+**Option 3 — Post-hoc (no live access needed):**
+
+Copy the log directory to your local machine after the job completes:
+
+```bash
+scp -r <user>@<cluster-host>:/path/to/NeoVerse/runs/neoverse_seg ./runs/
+tensorboard --logdir runs/neoverse_seg
+```
+
+### Logged Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `train/loss_step` | Cross-entropy loss per batch |
+| `train/loss_epoch` | Average loss per epoch |
+| `train/mIoU_epoch` | Mean IoU across all 4 classes per epoch |
+| `train/IoU_{class}` | Per-class IoU (right_hand, left_hand, object, background) |
+| `train/lr` | Learning rate |
+| `train/epoch_time_s` | Wall-clock time per epoch |
+
 ## Model Architecture
 
 NeoVerse has two main components:

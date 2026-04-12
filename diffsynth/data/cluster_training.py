@@ -1,12 +1,14 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import functional as TF
 from dataclasses import dataclass
 from typing import List
 import numpy as np
 from PIL import Image
 import os
+import time
 
 from diffsynth.auxiliary_models.worldmirror.models.heads.dense_head import DPTHead
 from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
@@ -40,10 +42,12 @@ class TrainConfig:
 
     #neoverse
     reconstruction_model_path = "models/NeoVerse/reconstructor.ckpt"
-    save_model_path_prefix = "model/NeoVerse/reconstructor"
-    save_model_path_suffix = "/.ckpt"
+    save_model_path_prefix = "models/NeoVerse/hand_seg_model"
     low_vram = False
     scene_type = "static_scene"
+
+    # Logging
+    log_dir: str = "runs/neoverse_seg"
 
 
 class NeoVerseReconstructor:
@@ -123,6 +127,50 @@ def get_criterion():
     return nn.CrossEntropyLoss()
 
 
+@torch.no_grad()
+def compute_miou(pred_logits, gt_mask, num_classes=4):
+    """Compute per-class IoU and mIoU from a single batch."""
+    pred = pred_logits.argmax(dim=1)  # [B, H, W]
+    gt = gt_mask.argmax(dim=1)        # [B, H, W]
+    intersection = torch.zeros(num_classes, device=pred.device)
+    union = torch.zeros(num_classes, device=pred.device)
+    for c in range(num_classes):
+        p = (pred == c)
+        g = (gt == c)
+        intersection[c] = (p & g).sum()
+        union[c] = (p | g).sum()
+    iou = intersection / (union + 1e-6)
+    return iou.mean().item(), iou
+
+
+def save_checkpoint(reconstructor, optimizer, epoch, avg_loss, avg_miou, cfg, best_loss):
+    """Save latest, best, and periodic (every 50 epochs) checkpoints.
+    Returns updated best_loss."""
+    ckpt = {
+        "epoch": epoch,
+        "model_state_dict": {
+            k: v for k, v in reconstructor.state_dict().items()
+            if "hand_pred_head" in k
+        },
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss": avg_loss,
+        "mIoU": avg_miou,
+    }
+
+    torch.save(ckpt, f"{cfg.save_model_path_prefix}_latest.ckpt")
+
+    if avg_loss < best_loss:
+        best_loss = avg_loss
+        torch.save(ckpt, f"{cfg.save_model_path_prefix}_best.ckpt")
+        print(f"  -> saved best checkpoint (loss={best_loss:.4f})")
+
+    if (epoch + 1) % 50 == 0:
+        torch.save(ckpt, f"{cfg.save_model_path_prefix}_epoch{epoch + 1}.ckpt")
+        print(f"  -> saved periodic checkpoint at epoch {epoch + 1}")
+
+    return best_loss
+
+
 def train():
     cfg = TrainConfig()
     worldmirror = NeoVerseReconstructor(cfg)
@@ -130,7 +178,7 @@ def train():
     dataset = HandObjectSegmentationDataset(image_root='diffsynth/data/training_images/',
                                             mask_root='diffsynth/data/training_masks/'
                                             )
-    
+
     sampler = ClipStreamSampler(dataset, shuffle_clips=True)
     dataloader = DataLoader(dataset, sampler=sampler, batch_size=cfg.batch_size, num_workers=4)
 
@@ -142,8 +190,19 @@ def train():
         weight_decay=cfg.weight_decay,
     )
 
+    # --- TensorBoard + checkpointing setup ---
+    writer = SummaryWriter(log_dir=cfg.log_dir)
+    save_dir = os.path.dirname(cfg.save_model_path_prefix)
+    os.makedirs(save_dir, exist_ok=True)
+    best_loss = float("inf")
+    global_step = 0
+    class_names = ["right_hand", "left_hand", "object", "background"]
+
     for epoch in range(cfg.epochs):
         epoch_loss = 0.0
+        epoch_miou = 0.0
+        t0 = time.time()
+
         for step, (images, gt_mask, _, _) in enumerate(dataloader):
             pred_rgb, pred_alpha, classifications = worldmirror.reconstruct(images)
             if cfg.device == "cuda":
@@ -154,8 +213,34 @@ def train():
             optimizer.step()
 
             epoch_loss += loss.item()
+            global_step += 1
 
-        print(f"Epoch {epoch + 1}/{cfg.epochs}  loss: {epoch_loss / (step + 1):.4f}")
+            # per-step scalar
+            writer.add_scalar("train/loss_step", loss.item(), global_step)
+
+            # batch mIoU (cheap, already computed)
+            miou, per_class = compute_miou(classifications.detach(), gt_mask, cfg.num_classes)
+            epoch_miou += miou
+
+        # --- epoch-level logging ---
+        avg_loss = epoch_loss / (step + 1)
+        avg_miou = epoch_miou / (step + 1)
+        elapsed = time.time() - t0
+
+        writer.add_scalar("train/loss_epoch", avg_loss, epoch)
+        writer.add_scalar("train/mIoU_epoch", avg_miou, epoch)
+        writer.add_scalar("train/epoch_time_s", elapsed, epoch)
+        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
+        for c, name in enumerate(class_names):
+            writer.add_scalar(f"train/IoU_{name}", per_class[c].item(), epoch)
+
+        print(f"Epoch {epoch + 1}/{cfg.epochs}  loss: {avg_loss:.4f}  mIoU: {avg_miou:.4f}  ({elapsed:.0f}s)")
+
+        best_loss = save_checkpoint(
+            worldmirror.reconstructor, optimizer, epoch, avg_loss, avg_miou, cfg, best_loss
+        )
+
+    writer.close()
 
 if __name__ == "__main__":
     train()
