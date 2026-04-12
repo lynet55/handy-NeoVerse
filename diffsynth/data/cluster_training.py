@@ -175,12 +175,11 @@ def train():
     cfg = TrainConfig()
     worldmirror = NeoVerseReconstructor(cfg)
 
-    dataset = HandObjectSegmentationDataset(image_root='diffsynth/data/training_images/',
+    train_dataset = HandObjectSegmentationDataset(image_root='diffsynth/data/training_images/',
                                             mask_root='diffsynth/data/training_masks/'
                                             )
-
-    sampler = ClipStreamSampler(dataset, shuffle_clips=True)
-    dataloader = DataLoader(dataset, sampler=sampler, batch_size=cfg.batch_size, num_workers=4)
+    train_sampler = ClipStreamSampler(train_dataset, shuffle_clips=True)
+    train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=cfg.batch_size, num_workers=4)
 
     criterion = get_criterion()
 
@@ -203,7 +202,7 @@ def train():
         epoch_miou = 0.0
         t0 = time.time()
 
-        for step, (images, gt_mask, _, _) in enumerate(dataloader):
+        for step, (images, gt_mask, _, _) in enumerate(train_loader):
             pred_rgb, pred_alpha, classifications = worldmirror.reconstruct(images)
             if cfg.device == "cuda":
                 gt_mask = gt_mask.to("cuda", non_blocking=True)
