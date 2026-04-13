@@ -218,8 +218,8 @@ def main() -> None:
     clip_start = args.clip_start
     clip_end = args.clip_end
     undistort = False
-    num_workers = 20
-    max_stored_clips = 24
+    num_workers = 2
+    max_stored_clips = 4
 
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(images_dir, exist_ok=True)
