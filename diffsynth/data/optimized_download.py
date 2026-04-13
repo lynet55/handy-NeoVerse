@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import io
 import logging
 import multiprocessing
 import os
@@ -24,9 +25,34 @@ OUTPUT_SIZE: Optional[tuple] = (280, 280)  # (width, height)
 
 TAR_DIR = Path("diffsynth/data/tar_recv")
 
+# Worker-process globals populated by the initializer. Avoids rebuilding
+# MANOHandModel once per clip (it was being reconstructed on every call).
+_WORKER_MANO_MODEL: Optional[MANOHandModel] = None
+_WORKER_HAND_TYPE: Optional[str] = None
 
-def setup_worker_logging(log_queue: multiprocessing.Queue) -> None:
-    """Initializer run in each worker process: route all logs to the shared queue."""
+
+def setup_worker(log_queue: multiprocessing.Queue, hand_type: str, mano_model_dir: Optional[str]) -> None:
+    """Initializer run in each worker process.
+
+    - Routes logs to the shared queue.
+    - Builds the MANO model once per worker and stashes it as a module global,
+      so subsequent process_clip calls reuse it.
+    """
+    global _WORKER_MANO_MODEL, _WORKER_HAND_TYPE
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(QueueHandler(log_queue))
+    root.setLevel(logging.INFO)
+
+    _WORKER_HAND_TYPE = hand_type
+    if hand_type == "mano" and mano_model_dir:
+        _WORKER_MANO_MODEL = MANOHandModel(mano_model_dir)
+    else:
+        _WORKER_MANO_MODEL = None
+
+
+def setup_parent_logging(log_queue: multiprocessing.Queue) -> None:
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(QueueHandler(log_queue))
@@ -37,6 +63,10 @@ def resize_image(arr: np.ndarray, size: Optional[tuple], is_mask: bool = False) 
     if size is None:
         return arr
     resample = Image.NEAREST if is_mask else Image.LANCZOS
+    # PIL copies non-contiguous arrays internally; do it explicitly so we
+    # avoid a hidden allocation path and make the intent clear.
+    if not arr.flags["C_CONTIGUOUS"]:
+        arr = np.ascontiguousarray(arr)
     return np.array(Image.fromarray(arr).resize(size, resample=resample))
 
 
@@ -50,16 +80,22 @@ def delete_tar(clip_name: str) -> None:
 
 def process_clip(
     clip_path: str,
-    hand_type: str,
-    mano_model_dir: Optional[str],
     undistort: bool,
     output_dir: str,
     images_dir: Optional[str] = None,
 ) -> str:
     log = logging.getLogger(__name__)
-    mano_model = MANOHandModel(mano_model_dir) if hand_type == "mano" and mano_model_dir else None
+    mano_model = _WORKER_MANO_MODEL
+    hand_type = _WORKER_HAND_TYPE
 
-    tar = tarfile.open(clip_path, mode="r")
+    # Read the whole tar into memory once. For clips that fit comfortably in
+    # RAM this eliminates repeated disk seeks across per-frame load_* calls.
+    # tarfile over a BytesIO does all seeks in-memory. If your clips are too
+    # large for this, replace with: open(clip_path, "rb", buffering=1<<20).
+    with open(clip_path, "rb") as f:
+        tar_bytes = f.read()
+    tar = tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r")
+
     clip_name = os.path.basename(clip_path).split(".tar")[0]
     clip_output_path = os.path.join(output_dir, clip_name)
     os.makedirs(clip_output_path, exist_ok=True)
@@ -68,6 +104,10 @@ def process_clip(
 
     total_frames = clip_util.get_number_of_frames(tar)
     log.info(f"Processing {clip_name} ({total_frames} frames)")
+
+    # Cache per-clip output dirs per stream so we only makedirs once per stream
+    # instead of once per frame per stream.
+    stream_image_dirs: Dict[str, str] = {}
 
     for frame_id in range(total_frames):
         frame_key = f"{frame_id:06d}"
@@ -100,8 +140,11 @@ def process_clip(
             stream_output_sizes[stream_key] = (image.shape[1], image.shape[0])
 
             if images_dir is not None:
-                stream_output_dir = os.path.join(images_dir, f"stream{stream_key}", clip_name)
-                os.makedirs(stream_output_dir, exist_ok=True)
+                stream_output_dir = stream_image_dirs.get(stream_key)
+                if stream_output_dir is None:
+                    stream_output_dir = os.path.join(images_dir, f"stream{stream_key}", clip_name)
+                    os.makedirs(stream_output_dir, exist_ok=True)
+                    stream_image_dirs[stream_key] = stream_output_dir
                 imageio.imwrite(os.path.join(stream_output_dir, f"{frame_key}.png"), image)
 
             if objects is not None:
@@ -111,10 +154,12 @@ def process_clip(
                         if mask_rle is None:
                             continue
                         mask = clip_util.decode_binary_mask_rle(mask_rle)
-                        if stream_key not in merged_object_masks:
+                        existing = merged_object_masks.get(stream_key)
+                        if existing is None:
                             merged_object_masks[stream_key] = mask
                         else:
-                            merged_object_masks[stream_key] = merged_object_masks[stream_key] | mask
+                            # In-place OR avoids allocating a new array each merge.
+                            np.bitwise_or(existing, mask, out=existing)
 
             for hand_side, hand_mesh in hand_meshes.items():
                 _, mask, _ = rasterizer.rasterize_mesh(
@@ -146,6 +191,7 @@ def process_clip(
         if (frame_id + 1) % 25 == 0 or (frame_id + 1) == total_frames:
             log.info(f"{clip_name}: {frame_id + 1}/{total_frames} frames")
 
+    tar.close()
     delete_tar(clip_name=clip_name)
     return clip_name
 
@@ -178,7 +224,7 @@ def main() -> None:
     listener = QueueListener(log_queue, console_handler, respect_handler_level=True)
     listener.start()
 
-    setup_worker_logging(log_queue)  # parent logs through the same queue for consistent format
+    setup_parent_logging(log_queue)
     log = logging.getLogger(__name__)
 
     download_index = clip_start
@@ -190,26 +236,37 @@ def main() -> None:
     try:
         with ProcessPoolExecutor(
             max_workers=num_workers,
-            initializer=setup_worker_logging,
-            initargs=(log_queue,),
+            initializer=setup_worker,
+            initargs=(log_queue, hand_type, mano_model_dir),
         ) as executor:
             futures: dict = {}
 
             while more_available or futures:
+                # Cache the directory listing once per loop iteration; we use
+                # it both for the on-disk gate and for picking pending files.
+                dir_entries = [p for p in os.listdir(clips_dir) if p.endswith(".tar")]
+                on_disk = len(dir_entries)
+
                 while more_available and (clip_end < 0 or download_index <= clip_end):
-                    on_disk = len([p for p in os.listdir(clips_dir) if p.endswith(".tar")])
                     if on_disk >= max_stored_clips:
                         break
                     log.info(f"Downloading clip {download_index}")
                     more_available = tar_hf_import(download_index)
                     if more_available:
                         download_index += 1
+                        on_disk += 1  # keep the gate honest without re-listing
+
+                # Build the "in-flight" set once instead of per candidate.
+                in_flight = set(futures.values())
+
+                # Re-list only if we downloaded; otherwise dir_entries is current.
+                if on_disk != len(dir_entries):
+                    dir_entries = [p for p in os.listdir(clips_dir) if p.endswith(".tar")]
 
                 pending_files = [
-                    p for p in os.listdir(clips_dir)
-                    if p.endswith(".tar")
-                    and p not in processed_clips
-                    and p not in {futures[f] for f in futures}
+                    p for p in dir_entries
+                    if p not in processed_clips
+                    and p not in in_flight
                     and get_clip_index(p) >= clip_start
                     and (clip_end < 0 or get_clip_index(p) <= clip_end)
                 ]
@@ -217,8 +274,6 @@ def main() -> None:
                     future = executor.submit(
                         process_clip,
                         os.path.join(clips_dir, clip),
-                        hand_type,
-                        mano_model_dir,
                         undistort,
                         output_dir,
                         images_dir,
