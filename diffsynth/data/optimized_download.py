@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""
+Download and pre-process HOT3D clips (masks + images) in a streaming pipeline.
+
+Designed to run on up to 3 independent CPU nodes in parallel.  Each node
+operates on a non-overlapping clip range and its own tar staging directory,
+while writing into the *shared* training_masks/ and training_images/ trees
+(safe because every clip writes only into its own sub-directory).
+
+Suggested 3-node split for clips 191-1199 (assuming 0-190 already done):
+  node 0: --clip-start 191 --clip-end 526  --tar-dir diffsynth/data/tar_recv
+  node 1: --clip-start 527 --clip-end 862  --tar-dir diffsynth/data/tar_recv_1
+  node 2: --clip-start 863 --clip-end 1199 --tar-dir diffsynth/data/tar_recv_2
+
+The script automatically skips clips whose output directory already exists and
+is non-empty, so re-running is safe and already-processed clips (0-190) are
+never re-downloaded or re-processed.
+"""
 import argparse
 import io
 import logging
@@ -24,21 +41,18 @@ from hand_tracking_toolkit.hand_models.mano_hand_model import MANOHandModel
 # Target size for saved images and masks. Set to None to skip resizing.
 OUTPUT_SIZE: Optional[tuple] = (280, 280)  # (width, height)
 
-TAR_DIR = Path("diffsynth/data/tar_recv")
-
-# Worker-process globals populated by the initializer. Avoids rebuilding
-# MANOHandModel once per clip (it was being reconstructed on every call).
+# Worker-process globals populated by the initializer.
 _WORKER_MANO_MODEL: Optional[MANOHandModel] = None
 _WORKER_HAND_TYPE: Optional[str] = None
 
 
-def setup_worker(log_queue: multiprocessing.Queue, hand_type: str, mano_model_dir: Optional[str], log_level: int = logging.INFO) -> None:
-    """Initializer run in each worker process.
-
-    - Routes logs to the shared queue.
-    - Builds the MANO model once per worker and stashes it as a module global,
-      so subsequent process_clip calls reuse it.
-    """
+def setup_worker(
+    log_queue: multiprocessing.Queue,
+    hand_type: str,
+    mano_model_dir: Optional[str],
+    log_level: int = logging.INFO,
+) -> None:
+    """Initializer run in each worker process."""
     global _WORKER_MANO_MODEL, _WORKER_HAND_TYPE
 
     root = logging.getLogger()
@@ -64,19 +78,9 @@ def resize_image(arr: np.ndarray, size: Optional[tuple], is_mask: bool = False) 
     if size is None:
         return arr
     resample = Image.NEAREST if is_mask else Image.LANCZOS
-    # PIL copies non-contiguous arrays internally; do it explicitly so we
-    # avoid a hidden allocation path and make the intent clear.
     if not arr.flags["C_CONTIGUOUS"]:
         arr = np.ascontiguousarray(arr)
     return np.array(Image.fromarray(arr).resize(size, resample=resample))
-
-
-def delete_tar(clip_name: str) -> None:
-    log = logging.getLogger(__name__)
-    tar_path = TAR_DIR / f"{clip_name}.tar"
-    if tar_path.exists():
-        tar_path.unlink()
-        log.info(f"Deleted {tar_path}")
 
 
 def process_clip(
@@ -85,15 +89,11 @@ def process_clip(
     output_dir: str,
     images_dir: Optional[str] = None,
 ) -> str:
+    """Process a single clip tar file. Deletes the tar on success. Returns clip name."""
     log = logging.getLogger(__name__)
     mano_model = _WORKER_MANO_MODEL
     hand_type = _WORKER_HAND_TYPE
-    log.debug(f"[worker] start clip_path={clip_path} mano_loaded={mano_model is not None}")
 
-    # Read the whole tar into memory once. For clips that fit comfortably in
-    # RAM this eliminates repeated disk seeks across per-frame load_* calls.
-    # tarfile over a BytesIO does all seeks in-memory. If your clips are too
-    # large for this, replace with: open(clip_path, "rb", buffering=1<<20).
     with open(clip_path, "rb") as f:
         tar_bytes = f.read()
     log.debug(f"[worker] read {len(tar_bytes)/1e6:.1f} MB from {os.path.basename(clip_path)}")
@@ -104,12 +104,9 @@ def process_clip(
     os.makedirs(clip_output_path, exist_ok=True)
 
     hand_shape: Optional[HandShapeCollection] = clip_util.load_hand_shape(tar)
-
     total_frames = clip_util.get_number_of_frames(tar)
     log.info(f"Processing {clip_name} ({total_frames} frames)")
 
-    # Cache per-clip output dirs per stream so we only makedirs once per stream
-    # instead of once per frame per stream.
     stream_image_dirs: Dict[str, str] = {}
 
     for frame_id in range(total_frames):
@@ -161,7 +158,6 @@ def process_clip(
                         if existing is None:
                             merged_object_masks[stream_key] = mask
                         else:
-                            # In-place OR avoids allocating a new array each merge.
                             np.bitwise_or(existing, mask, out=existing)
 
             for hand_side, hand_mesh in hand_meshes.items():
@@ -175,19 +171,19 @@ def process_clip(
                 mask_out = resize_image(mask_out, stream_output_sizes[stream_key], is_mask=True)
                 mask_path = os.path.join(
                     clip_output_path,
-                    f"{frame_key}_mask_stream{stream_key}_hand_{hand_side.name}.png"
+                    f"{frame_key}_mask_stream{stream_key}_hand_{hand_side.name}.png",
                 )
                 imageio.imwrite(mask_path, mask_out)
 
         for stream_key, merged in merged_object_masks.items():
-            mask_path = os.path.join(
-                clip_output_path,
-                f"{frame_key}_mask_stream{stream_key}_object.png"
-            )
             merged_out = resize_image(
                 np.rot90(merged.astype(np.uint8) * 255, k=3),
                 stream_output_sizes.get(stream_key),
                 is_mask=True,
+            )
+            mask_path = os.path.join(
+                clip_output_path,
+                f"{frame_key}_mask_stream{stream_key}_object.png",
             )
             imageio.imwrite(mask_path, merged_out)
 
@@ -195,7 +191,14 @@ def process_clip(
             log.info(f"{clip_name}: {frame_id + 1}/{total_frames} frames")
 
     tar.close()
-    delete_tar(clip_name=clip_name)
+
+    # Delete the tar now that processing is complete.
+    try:
+        os.remove(clip_path)
+        log.info(f"Deleted {clip_path}")
+    except OSError as e:
+        log.warning(f"Could not delete {clip_path}: {e}")
+
     return clip_name
 
 
@@ -203,30 +206,56 @@ def get_clip_index(filename: str) -> int:
     return int(filename.split(".tar")[0].split("clip-")[1])
 
 
+def already_processed(clip_name: str, output_dir: str) -> bool:
+    """True if the clip's output directory exists and contains at least one file."""
+    clip_out = os.path.join(output_dir, clip_name)
+    return os.path.isdir(clip_out) and bool(os.listdir(clip_out))
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Process hand/object clips into masks and images.")
-    parser.add_argument("--clip-start", type=int, default=0, help="First clip index to process (inclusive).")
-    parser.add_argument("--clip-end", type=int, default=-1, help="Last clip index to process (inclusive). -1 means no upper bound.")
+    parser = argparse.ArgumentParser(
+        description="Process HOT3D clips into masks and images (multi-node safe).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--clip-start", type=int, default=191,
+                        help="First clip index to process (inclusive). Default: 191 (resumes after pre-processed 0-190).")
+    parser.add_argument("--clip-end", type=int, default=-1,
+                        help="Last clip index to process (inclusive). -1 = no upper bound.")
+    parser.add_argument("--tar-dir", type=str, default="diffsynth/data/tar_recv",
+                        help="Directory for staging downloaded tars. Use a separate dir per node.")
+    parser.add_argument("--output-dir", type=str, default="diffsynth/data/training_masks",
+                        help="Directory for output masks (shared across nodes).")
+    parser.add_argument("--images-dir", type=str, default="diffsynth/data/training_images",
+                        help="Directory for output images (shared across nodes). Empty string to skip.")
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="Number of parallel processing workers.")
+    parser.add_argument("--max-stored-clips", type=int, default=4,
+                        help="Max tars allowed on disk in tar-dir at once (download throttle).")
+    parser.add_argument("--mano-model-dir", type=str,
+                        default="./diffsynth/data/mano/models/",
+                        help="Path to MANO model directory containing MANO_LEFT.pkl and MANO_RIGHT.pkl.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging.")
     args = parser.parse_args()
 
-    clips_dir = "./diffsynth/data/tar_recv/"
-    mano_model_dir = "./diffsynth/data/mano/models/"
-    output_dir = "./diffsynth/data/training_masks/"
-    images_dir = "./diffsynth/data/training_images/"
-    hand_type = "mano"
-    clip_start = args.clip_start
-    clip_end = args.clip_end
-    undistort = False
-    num_workers = 2
-    max_stored_clips = 4
+    clips_dir     = args.tar_dir
+    output_dir    = args.output_dir
+    images_dir    = args.images_dir if args.images_dir else None
+    mano_model_dir = args.mano_model_dir
+    hand_type      = "mano"
+    clip_start     = args.clip_start
+    clip_end       = args.clip_end
+    num_workers    = args.num_workers
+    max_stored_clips = args.max_stored_clips
+    undistort      = False  # kept False throughout; not exposed as CLI arg
 
+    os.makedirs(clips_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(images_dir, exist_ok=True)
+    if images_dir:
+        os.makedirs(images_dir, exist_ok=True)
 
     log_level = logging.DEBUG if args.debug else logging.INFO
 
-    # --- Logging setup: single listener in the parent, queue-fed from workers ---
     log_queue: multiprocessing.Queue = multiprocessing.Manager().Queue(-1)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
@@ -239,11 +268,35 @@ def main() -> None:
     setup_parent_logging(log_queue, log_level)
     log = logging.getLogger(__name__)
 
+    range_str = f"{clip_start}–{clip_end if clip_end >= 0 else '∞'}"
+    log.info(f"Starting pipeline | clips: {range_str} | tar-dir: {clips_dir} | "
+             f"workers: {num_workers} | max-on-disk: {max_stored_clips}")
+
+    # --- Pre-populate already-done set from output_dir ---
+    # Any clip whose output subdir exists and is non-empty is considered done.
+    processed_clips: set[str] = set()
+    if os.path.isdir(output_dir):
+        for name in os.listdir(output_dir):
+            if already_processed(name, output_dir):
+                processed_clips.add(f"{name}.tar")
+    log.info(f"Already processed: {len(processed_clips)} clips (will skip)")
+
+    # --- Clean up stale tars that are already processed ---
+    # These were left over from previous interrupted runs.
+    stale = [
+        p for p in os.listdir(clips_dir)
+        if p.endswith(".tar") and p in processed_clips
+    ]
+    for p in stale:
+        stale_path = os.path.join(clips_dir, p)
+        try:
+            os.remove(stale_path)
+            log.info(f"Cleaned up stale tar: {stale_path}")
+        except OSError as e:
+            log.warning(f"Could not remove stale tar {stale_path}: {e}")
+
     download_index = clip_start
     more_available = True
-    processed_clips: set[str] = set()
-
-    log.info(f"Starting pipeline (max {max_stored_clips} clips on disk, {num_workers} workers)")
 
     try:
         with ProcessPoolExecutor(
@@ -254,21 +307,34 @@ def main() -> None:
             futures: dict = {}
 
             while more_available or futures:
+                # --- Download loop: fill up to max_stored_clips ---
                 while more_available and (clip_end < 0 or download_index <= clip_end):
                     on_disk = len([p for p in os.listdir(clips_dir) if p.endswith(".tar")])
-                    log.debug(f"[download] on_disk={on_disk} max={max_stored_clips} next_idx={download_index} more_available={more_available}")
                     if on_disk >= max_stored_clips:
-                        log.debug(f"[download] disk full ({on_disk}/{max_stored_clips}), pausing downloads")
+                        log.debug(f"[download] disk full ({on_disk}/{max_stored_clips}), pausing")
                         break
-                    log.info(f"Downloading clip {download_index}")
-                    more_available = tar_hf_import(download_index)
-                    log.debug(f"[download] tar_hf_import({download_index}) -> more_available={more_available}")
-                    if more_available:
+
+                    # Skip clips already processed (avoids re-downloading)
+                    clip_filename = f"clip-{download_index:06d}.tar"
+                    if clip_filename in processed_clips:
+                        log.debug(f"[download] skipping already-done clip {download_index}")
                         download_index += 1
+                        continue
 
-                # Build the "in-flight" set once instead of rebuilding it per candidate.
+                    log.info(f"Downloading clip {download_index}")
+                    try:
+                        found = tar_hf_import(download_index, dest_dir=clips_dir)
+                    except Exception as exc:
+                        log.error(f"Download error for clip {download_index}: {exc}")
+                        break
+                    if not found:
+                        log.info(f"Clip {download_index} returned 404 — end of dataset.")
+                        more_available = False
+                        break
+                    download_index += 1
+
+                # --- Submit ready tars to workers ---
                 in_flight = set(futures.values())
-
                 pending_files = [
                     p for p in os.listdir(clips_dir)
                     if p.endswith(".tar")
@@ -277,7 +343,8 @@ def main() -> None:
                     and get_clip_index(p) >= clip_start
                     and (clip_end < 0 or get_clip_index(p) <= clip_end)
                 ]
-                log.debug(f"[schedule] in_flight={len(in_flight)} pending={len(pending_files)} processed={len(processed_clips)}")
+                log.debug(f"[schedule] in_flight={len(in_flight)} pending={len(pending_files)} "
+                          f"processed={len(processed_clips)}")
                 for clip in pending_files:
                     future = executor.submit(
                         process_clip,
@@ -289,15 +356,14 @@ def main() -> None:
                     futures[future] = clip
                     log.info(f"Submitted {clip}")
 
+                # --- Collect completed futures ---
                 done = [f for f in futures if f.done()]
-                if done:
-                    log.debug(f"[schedule] {len(done)} future(s) completed this tick")
                 for future in done:
                     clip = futures.pop(future)
                     try:
                         clip_name = future.result()
                         processed_clips.add(clip)
-                        log.info(f"Done {clip_name}")
+                        log.info(f"Done: {clip_name}")
                     except Exception as exc:
                         log.exception(f"ERROR processing {clip}: {exc}")
 
