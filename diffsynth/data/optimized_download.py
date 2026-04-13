@@ -207,10 +207,10 @@ def main() -> None:
     parser.add_argument("--clip-end", type=int, default=-1, help="Last clip index to process (inclusive). -1 means no upper bound.")
     args = parser.parse_args()
 
-    clips_dir = "./diffsynth/data/tar_recv/"
+    clips_dir = "./diffsynth/data/tar_recv_1/"
     mano_model_dir = "./diffsynth/data/mano/models/"
-    output_dir = "./diffsynth/data/training_masks/"
-    images_dir = "./diffsynth/data/training_images/"
+    output_dir = "./diffsynth/data/training_masks_1/"
+    images_dir = "./diffsynth/data/training_images_1/"
     hand_type = "mano"
     clip_start = args.clip_start
     clip_end = args.clip_end
