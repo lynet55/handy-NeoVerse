@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import io
 import logging
 import multiprocessing
@@ -201,13 +202,18 @@ def get_clip_index(filename: str) -> int:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Process hand/object clips into masks and images.")
+    parser.add_argument("--clip-start", type=int, default=0, help="First clip index to process (inclusive).")
+    parser.add_argument("--clip-end", type=int, default=-1, help="Last clip index to process (inclusive). -1 means no upper bound.")
+    args = parser.parse_args()
+
     clips_dir = "./diffsynth/data/tar_recv/"
     mano_model_dir = "./diffsynth/data/mano/models/"
     output_dir = "./diffsynth/data/training_masks/"
     images_dir = "./diffsynth/data/training_images/"
     hand_type = "mano"
-    clip_start = 0
-    clip_end = -1
+    clip_start = args.clip_start
+    clip_end = args.clip_end
     undistort = False
     num_workers = 20
     max_stored_clips = 24
