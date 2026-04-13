@@ -32,7 +32,7 @@ _WORKER_MANO_MODEL: Optional[MANOHandModel] = None
 _WORKER_HAND_TYPE: Optional[str] = None
 
 
-def setup_worker(log_queue: multiprocessing.Queue, hand_type: str, mano_model_dir: Optional[str]) -> None:
+def setup_worker(log_queue: multiprocessing.Queue, hand_type: str, mano_model_dir: Optional[str], log_level: int = logging.INFO) -> None:
     """Initializer run in each worker process.
 
     - Routes logs to the shared queue.
@@ -44,7 +44,7 @@ def setup_worker(log_queue: multiprocessing.Queue, hand_type: str, mano_model_di
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(QueueHandler(log_queue))
-    root.setLevel(logging.INFO)
+    root.setLevel(log_level)
 
     _WORKER_HAND_TYPE = hand_type
     if hand_type == "mano" and mano_model_dir:
@@ -53,11 +53,11 @@ def setup_worker(log_queue: multiprocessing.Queue, hand_type: str, mano_model_di
         _WORKER_MANO_MODEL = None
 
 
-def setup_parent_logging(log_queue: multiprocessing.Queue) -> None:
+def setup_parent_logging(log_queue: multiprocessing.Queue, log_level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(QueueHandler(log_queue))
-    root.setLevel(logging.INFO)
+    root.setLevel(log_level)
 
 
 def resize_image(arr: np.ndarray, size: Optional[tuple], is_mask: bool = False) -> np.ndarray:
@@ -88,6 +88,7 @@ def process_clip(
     log = logging.getLogger(__name__)
     mano_model = _WORKER_MANO_MODEL
     hand_type = _WORKER_HAND_TYPE
+    log.debug(f"[worker] start clip_path={clip_path} mano_loaded={mano_model is not None}")
 
     # Read the whole tar into memory once. For clips that fit comfortably in
     # RAM this eliminates repeated disk seeks across per-frame load_* calls.
@@ -95,6 +96,7 @@ def process_clip(
     # large for this, replace with: open(clip_path, "rb", buffering=1<<20).
     with open(clip_path, "rb") as f:
         tar_bytes = f.read()
+    log.debug(f"[worker] read {len(tar_bytes)/1e6:.1f} MB from {os.path.basename(clip_path)}")
     tar = tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r")
 
     clip_name = os.path.basename(clip_path).split(".tar")[0]
@@ -205,12 +207,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Process hand/object clips into masks and images.")
     parser.add_argument("--clip-start", type=int, default=0, help="First clip index to process (inclusive).")
     parser.add_argument("--clip-end", type=int, default=-1, help="Last clip index to process (inclusive). -1 means no upper bound.")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging.")
     args = parser.parse_args()
 
-    clips_dir = "./diffsynth/data/tar_recv_1/"
+    clips_dir = "./diffsynth/data/tar_recv/"
     mano_model_dir = "./diffsynth/data/mano/models/"
-    output_dir = "./diffsynth/data/training_masks_1/"
-    images_dir = "./diffsynth/data/training_images_1/"
+    output_dir = "./diffsynth/data/training_masks/"
+    images_dir = "./diffsynth/data/training_images/"
     hand_type = "mano"
     clip_start = args.clip_start
     clip_end = args.clip_end
@@ -221,16 +224,19 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(images_dir, exist_ok=True)
 
+    log_level = logging.DEBUG if args.debug else logging.INFO
+
     # --- Logging setup: single listener in the parent, queue-fed from workers ---
     log_queue: multiprocessing.Queue = multiprocessing.Manager().Queue(-1)
     console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
     console_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(processName)s] %(message)s", "%H:%M:%S")
+        logging.Formatter("%(asctime)s [%(processName)s] %(levelname)s %(message)s", "%H:%M:%S")
     )
     listener = QueueListener(log_queue, console_handler, respect_handler_level=True)
     listener.start()
 
-    setup_parent_logging(log_queue)
+    setup_parent_logging(log_queue, log_level)
     log = logging.getLogger(__name__)
 
     download_index = clip_start
@@ -243,39 +249,35 @@ def main() -> None:
         with ProcessPoolExecutor(
             max_workers=num_workers,
             initializer=setup_worker,
-            initargs=(log_queue, hand_type, mano_model_dir),
+            initargs=(log_queue, hand_type, mano_model_dir, log_level),
         ) as executor:
             futures: dict = {}
 
             while more_available or futures:
-                # Cache the directory listing once per loop iteration; we use
-                # it both for the on-disk gate and for picking pending files.
-                dir_entries = [p for p in os.listdir(clips_dir) if p.endswith(".tar")]
-                on_disk = len(dir_entries)
-
                 while more_available and (clip_end < 0 or download_index <= clip_end):
+                    on_disk = len([p for p in os.listdir(clips_dir) if p.endswith(".tar")])
+                    log.debug(f"[download] on_disk={on_disk} max={max_stored_clips} next_idx={download_index} more_available={more_available}")
                     if on_disk >= max_stored_clips:
+                        log.debug(f"[download] disk full ({on_disk}/{max_stored_clips}), pausing downloads")
                         break
                     log.info(f"Downloading clip {download_index}")
                     more_available = tar_hf_import(download_index)
+                    log.debug(f"[download] tar_hf_import({download_index}) -> more_available={more_available}")
                     if more_available:
                         download_index += 1
-                        on_disk += 1  # keep the gate honest without re-listing
 
-                # Build the "in-flight" set once instead of per candidate.
+                # Build the "in-flight" set once instead of rebuilding it per candidate.
                 in_flight = set(futures.values())
 
-                # Re-list only if we downloaded; otherwise dir_entries is current.
-                if on_disk != len(dir_entries):
-                    dir_entries = [p for p in os.listdir(clips_dir) if p.endswith(".tar")]
-
                 pending_files = [
-                    p for p in dir_entries
-                    if p not in processed_clips
+                    p for p in os.listdir(clips_dir)
+                    if p.endswith(".tar")
+                    and p not in processed_clips
                     and p not in in_flight
                     and get_clip_index(p) >= clip_start
                     and (clip_end < 0 or get_clip_index(p) <= clip_end)
                 ]
+                log.debug(f"[schedule] in_flight={len(in_flight)} pending={len(pending_files)} processed={len(processed_clips)}")
                 for clip in pending_files:
                     future = executor.submit(
                         process_clip,
@@ -288,6 +290,8 @@ def main() -> None:
                     log.info(f"Submitted {clip}")
 
                 done = [f for f in futures if f.done()]
+                if done:
+                    log.debug(f"[schedule] {len(done)} future(s) completed this tick")
                 for future in done:
                     clip = futures.pop(future)
                     try:
