@@ -150,6 +150,24 @@ def compute_miou(pred_logits, gt_mask, num_classes=4):
     return iou.mean().item(), iou
 
 
+def save_step_checkpoint(reconstructor, optimizer, epoch, global_step, loss, miou, cfg):
+    """Save a per-step checkpoint for early validation."""
+    ckpt = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": {
+            k: v for k, v in reconstructor.state_dict().items()
+            if "hand_pred_head" in k
+        },
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss": loss,
+        "mIoU": miou,
+    }
+    path = f"{cfg.save_model_path_prefix}_step{global_step}.ckpt"
+    torch.save(ckpt, path)
+    dbg(f"  -> saved step checkpoint at global_step={global_step} (loss={loss:.4f}, mIoU={miou:.4f})")
+
+
 def save_checkpoint(reconstructor, optimizer, epoch, avg_loss, avg_miou, cfg, best_loss):
     """Save latest, best, and periodic (every 50 epochs) checkpoints. Returns updated best_loss."""
     ckpt = {
@@ -266,10 +284,28 @@ def train():
             epoch_miou += miou
             epoch_per_class += per_class
 
+            writer.add_scalar("train/mIoU_step", miou, global_step)
+            for c, name in enumerate(class_names):
+                writer.add_scalar(f"train/IoU_{name}_step", per_class[c].item(), global_step)
+            writer.add_scalar("train/step_time", step_time, global_step)
+            writer.add_scalar("train/fetch_time", fetch_time, global_step)
+
             # Print every step early on, then every 10 once stable
             if step < 5 or step % 10 == 0:
                 dbg(f"  step {step}: loss={loss.item():.4f} mIoU={miou:.4f} "
                     f"fetch={fetch_time:.2f}s step={step_time:.2f}s")
+
+            # Per-step checkpointing: early save in first epoch, every 10k steps otherwise
+            if epoch == 0 and step == 5:
+                save_step_checkpoint(
+                    worldmirror.reconstructor, optimizer, epoch, global_step,
+                    loss.item(), miou, cfg,
+                )
+            elif global_step > 0 and global_step % 10_000 == 0:
+                save_step_checkpoint(
+                    worldmirror.reconstructor, optimizer, epoch, global_step,
+                    loss.item(), miou, cfg,
+                )
 
         if step < 0:
             dbg("WARNING: epoch produced 0 steps. Dataset/sampler may be empty.")
