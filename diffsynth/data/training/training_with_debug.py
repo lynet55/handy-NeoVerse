@@ -37,7 +37,7 @@ class TrainConfig:
     # Training Hyperparameters
     batch_size: int = 10
     num_frames: int = 4
-    epochs: int = 15
+    epochs: int = 3
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
 
@@ -58,7 +58,7 @@ class TrainConfig:
     # DataLoader
     # Start with 0 to confirm no DataLoader-fork hang. Bump to (cpus_per_task - 1)
     # once the first epoch completes cleanly.
-    num_workers: int = 3
+    num_workers: int = 2
     pin_memory: bool = True
 
 
