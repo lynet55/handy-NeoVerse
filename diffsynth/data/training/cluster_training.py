@@ -15,7 +15,7 @@ from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import Wor
 from diffsynth.models.model_manager import ModelManager
 from diffsynth.utils.auxiliary import homo_matrix_inverse
 
-from .SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
+from ..SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
 
 @dataclass
 class TrainConfig:
