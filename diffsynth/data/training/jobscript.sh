@@ -42,7 +42,7 @@ echo "------------------------------------------"
 # ---------- Run ----------
 START=$(date +%s)
 
-python -u -m diffsynth.data.cluster_training
+python -u -m diffsynth.data.training.training_with_debug
 EXIT_CODE=$?
 
 END=$(date +%s)
