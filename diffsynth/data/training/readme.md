@@ -3,7 +3,7 @@
 ## VPN Connection
 
 ```bash
-sudo openconnect -u 'bbalinov@student-net.ethz.ch' \
+sudo openconnect -u 'user@student-net.ethz.ch' \
   --useragent=AnyConnect \
   -g student-net \
   sslvpn.ethz.ch \
@@ -27,7 +27,7 @@ sbatch jobscript.sh
 Forward the remote TensorBoard port to your local machine:
 
 ```bash
-ssh -N -L 6006:localhost:6006 bbalinov@student-cluster1.inf.ethz.ch
+ssh -N -L 6006:localhost:6006 user@student-cluster1.inf.ethz.ch
 ```
 
 Then open <http://localhost:6006> in your local browser.
