@@ -321,7 +321,7 @@ def train():
             images, gt_mask, _, _ = batch
 
             t_fwd = time.time()
-            classifications = model.forward(images)
+            classifications = model.forward(images).permute(0,1,4,2,3)[0]
 
             if cfg.device == "cuda":
                 gt_mask = gt_mask.to("cuda", non_blocking=True)
