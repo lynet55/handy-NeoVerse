@@ -20,7 +20,7 @@ from torchvision.transforms import functional as F
 from diffsynth.models import ModelManager
 from diffsynth.utils.auxiliary import load_video, homo_matrix_inverse
 from diffsynth.utils.app import extract_point_cloud, build_scene_glb
-from diffsynth import save_video
+from diffsynth import save_video, save_frames
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--reconstructor_path", default="models/NeoVerse/reconstructor.ckpt")
@@ -148,4 +148,10 @@ with gr.Blocks(title="NeoVerse — Reconstruction Viewer") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue(max_size=3).launch(show_error=True, server_name="0.0.0.0", server_port=7860)
+    # demo.queue(max_size=3).launch(show_error=True, server_name="0.0.0.0", server_port=7860)
+    glb_path, splat_video_path, info = reconstruct(
+        "examples/videos/driving.mp4", "General scene"
+    )
+    print(info)
+    print(f"GLB saved to: {glb_path}")
+    print(f"Splat render saved to: {splat_video_path}")
