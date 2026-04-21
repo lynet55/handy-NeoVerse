@@ -116,7 +116,7 @@ def reconstruct(video_path, scene_type):
         render_Ks=[input_intrs],
         render_timestamps=[input_timestamps],
         sh_degree=0, width=res_w, height=res_h,
-        render_classes = [0, 1, 0, 1]
+        render_classes = [0, 3]
     )
     # target_rgb: [1, S, H, W, 3] float in [0,1]
     frames = [
