@@ -24,6 +24,9 @@ from diffsynth import save_video, save_frames
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--reconstructor_path", default="models/NeoVerse/reconstructor.ckpt")
+parser.add_argument("--hand_head_path", default="models/NeoVerse/hand_seg_model_opt_best.ckpt",
+                    help="Optional checkpoint with retrained hand_pred_head weights "
+                         "(overrides the hand_pred_head layers from the base reconstructor).")
 parser.add_argument("--low_vram", action="store_true",
                     help="Keep model on CPU; move to GPU only during inference")
 parser.add_argument("--max_frames", type=int, default=81,
@@ -47,6 +50,20 @@ model_manager = ModelManager()
 model_manager.load_model(args.reconstructor_path, device=load_device, torch_dtype=torch.bfloat16)
 reconstructor = model_manager.fetch_model("reconstructor")
 print("Reconstructor loaded.")
+
+if args.hand_head_path is not None:
+    print(f"Overriding hand_pred_head from {args.hand_head_path}...")
+    ckpt = torch.load(args.hand_head_path, map_location="cpu")
+    sd = ckpt.get("model_state_dict", ckpt)
+    sd = {k: v for k, v in sd.items() if k.startswith("hand_pred_head.")}
+    if not sd:
+        raise RuntimeError(f"No 'hand_pred_head.*' keys found in {args.hand_head_path}")
+    missing, unexpected = reconstructor.load_state_dict(sd, strict=False)
+    unexpected_hand = [k for k in unexpected if k.startswith("hand_pred_head.")]
+    if unexpected_hand:
+        raise RuntimeError(f"Unexpected hand_pred_head keys: {unexpected_hand}")
+    reconstructor.hand_pred_head.to(device=load_device, dtype=torch.bfloat16)
+    print(f"  -> loaded {len(sd)} hand_pred_head tensors.")
 
 
 @torch.no_grad()
