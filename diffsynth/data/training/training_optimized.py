@@ -50,6 +50,7 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     lr_min_factor: float = 0.01  # cosine annealing decays to lr * this factor
+    class_weights = torch.tensor([0.98, 0.98, 0.98, 0.02])
 
     optimizer = torch.optim.AdamW
 
@@ -193,8 +194,8 @@ class StridedHandObjectDataset(HandObjectSegmentationDataset):
 # Metrics & checkpointing (unchanged from original)
 # ---------------------------------------------------------------------------
 
-def get_criterion():
-    return nn.CrossEntropyLoss()
+def get_criterion(cfg):
+    return nn.CrossEntropyLoss(weight=cfg.class_weights)
 
 
 @torch.no_grad()
@@ -279,7 +280,7 @@ def train():
     )
 
     # ---- optimiser + scheduler ----
-    criterion = get_criterion()
+    criterion = get_criterion(cfg=cfg)
     trainable = [p for p in model.head.parameters() if p.requires_grad]
     dbg(f"Optimizer: {len(trainable)} trainable tensors")
     optimizer = cfg.optimizer(trainable, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
