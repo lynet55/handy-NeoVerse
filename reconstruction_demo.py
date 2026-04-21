@@ -99,6 +99,7 @@ def reconstruct(video_path, scene_type):
         render_Ks=[input_intrs],
         render_timestamps=[input_timestamps],
         sh_degree=0, width=res_w, height=res_h,
+        render_classes = [0, 1, 0, 1]
     )
     # target_rgb: [1, S, H, W, 3] float in [0,1]
     frames = [
@@ -147,4 +148,4 @@ with gr.Blocks(title="NeoVerse — Reconstruction Viewer") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue(max_size=3).launch(show_error=True)
+    demo.queue(max_size=3).launch(show_error=True, server_name="0.0.0.0", server_port=7860)
