@@ -11,6 +11,7 @@ Key optimizations over training_with_debug.py:
 import math
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -22,6 +23,9 @@ from dataclasses import dataclass
 from diffsynth.auxiliary_models.worldmirror.models.heads.dense_head import DPTHead
 from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
 from diffsynth.models.model_manager import ModelManager
+
+from datetime import datetime
+from dataclasses import dataclass, field
 
 from ..SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
 
@@ -46,7 +50,7 @@ class TrainConfig:
 
     # Training Hyperparameters
     batch_size: int = 10
-    epochs: int = 3
+    epochs: int = 10
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     lr_min_factor: float = 0.01  # cosine annealing decays to lr * this factor
@@ -56,6 +60,7 @@ class TrainConfig:
 
     # Dataset
     frame_stride: int = 5  # sample every Nth frame (1 = all frames, original behaviour)
+    val_fraction: float = 0.1  # fraction of clips held out for validation
 
     # Environment
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,7 +71,9 @@ class TrainConfig:
     low_vram = False
 
     # Logging
-    log_dir: str = "runs/neoverse_seg_opt"
+    log_dir: str = field(
+        default_factory=lambda: "runs/neoverse_seg_opt_" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
 
     # DataLoader
     num_workers: int = 2
@@ -137,11 +144,14 @@ class LeanReconstructor:
         """Backbone (frozen, no_grad) -> hand_pred_head (trainable).
 
         Args:
-            images: [S, 3, H, W] single-sample batch from dataset.
+            images: [B, 3, H, W] batch of frames from DataLoader.
 
         Returns:
-            classifications: [S, num_classes, H, W] logits.
+            classifications: [B, H, W, num_classes] logits (channels-last, as
+                produced by activate_head). Caller applies .permute(0,3,1,2) to
+                get [B, num_classes, H, W] for CrossEntropyLoss.
         """
+        # Treat the batch dimension as the sequence dimension S expected by the backbone.
         imgs = images.unsqueeze(0).to(self.cfg.device, non_blocking=True)
 
         # 1. Frozen backbone — single pass, no graph built
@@ -153,7 +163,7 @@ class LeanReconstructor:
                 token_list, images=imgs, patch_start_idx=patch_start_idx,
             )
 
-        # classifications shape: [B, S, num_classes, H, W] → squeeze batch
+        # head returns [B=1, S, H, W, num_classes] (channels-last) → squeeze batch dim
         return classifications.squeeze(0).float()
 
 
@@ -162,21 +172,25 @@ class LeanReconstructor:
 # ---------------------------------------------------------------------------
 
 class StridedHandObjectDataset(HandObjectSegmentationDataset):
-    """HandObjectSegmentationDataset with frame sub-sampling.
+    """HandObjectSegmentationDataset with frame sub-sampling and optional clip filter.
 
     Consecutive video frames are near-identical.  A stride of N keeps every
     Nth frame, cutting dataset size (and redundancy) proportionally.
+
+    clip_names: optional set of clip stems (e.g. {"clip-000001", ...}) to
+        include.  If None, all clips in data_root are used.
     """
 
-    def __init__(self, data_root: str, frame_stride: int = 1, streams=None):
+    def __init__(self, data_root: str, frame_stride: int = 1, streams=None, clip_names=None):
         self._frame_stride = frame_stride
+        self._clip_names_filter = clip_names  # None → include all
         super().__init__(data_root=data_root, streams=streams)
 
     def _build_index(self) -> None:
-        from pathlib import Path
-
         for npz_path in sorted(Path(self.data_root).glob("clip-*.npz")):
             clip_name = npz_path.stem
+            if self._clip_names_filter is not None and clip_name not in self._clip_names_filter:
+                continue
             npz = np.load(str(npz_path), mmap_mode="r")
             n_frames = next(
                 npz[k].shape[0] for k in npz.files if k.startswith("images_")
@@ -191,11 +205,11 @@ class StridedHandObjectDataset(HandObjectSegmentationDataset):
 
 
 # ---------------------------------------------------------------------------
-# Metrics & checkpointing (unchanged from original)
+# Metrics & checkpointing
 # ---------------------------------------------------------------------------
 
 def get_criterion(cfg):
-    return nn.CrossEntropyLoss(weight=cfg.class_weights)
+    return nn.CrossEntropyLoss(weight=cfg.class_weights.to(cfg.device))
 
 
 @torch.no_grad()
@@ -227,22 +241,47 @@ def save_step_checkpoint(head, optimizer, epoch, global_step, loss, miou, cfg):
     dbg(f"  -> step checkpoint global_step={global_step} (loss={loss:.4f}, mIoU={miou:.4f})")
 
 
-def save_checkpoint(head, optimizer, epoch, avg_loss, avg_miou, cfg, best_loss):
+def save_checkpoint(head, optimizer, epoch, train_loss, avg_miou, val_loss, cfg, best_val_loss):
     ckpt = {
         "epoch": epoch,
         "model_state_dict": head.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "loss": avg_loss,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
         "mIoU": avg_miou,
     }
     torch.save(ckpt, f"{cfg.save_model_path_prefix}_latest.ckpt")
-    if avg_loss < best_loss:
-        best_loss = avg_loss
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
         torch.save(ckpt, f"{cfg.save_model_path_prefix}_best.ckpt")
-        dbg(f"  -> new best (loss={best_loss:.4f})")
-    if (epoch + 1) % 50 == 0:
-        torch.save(ckpt, f"{cfg.save_model_path_prefix}_epoch{epoch + 1}.ckpt")
-    return best_loss
+        dbg(f"  -> new best val (val_loss={best_val_loss:.4f})")
+    return best_val_loss
+
+
+# ---------------------------------------------------------------------------
+# Validation loop
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(model, val_loader, criterion, cfg, class_names):
+    model.head.eval()
+    total_loss, total_miou, n_steps = 0.0, 0.0, 0
+    per_class = torch.zeros(cfg.num_classes, device=cfg.device)
+    for batch in val_loader:
+        images, gt_mask, _, _ = batch
+        classifications = model.forward(images).permute(0, 3, 1, 2)
+        if cfg.device == "cuda":
+            gt_mask = gt_mask.to("cuda", non_blocking=True)
+        loss = criterion(classifications, gt_mask.argmax(dim=1).long())
+        miou, pc = compute_miou(classifications, gt_mask, cfg.num_classes)
+        total_loss += loss.item()
+        total_miou += miou
+        per_class += pc
+        n_steps += 1
+    model.head.train()
+    if n_steps == 0:
+        return None, None, None
+    return total_loss / n_steps, total_miou / n_steps, per_class / n_steps
 
 
 # ---------------------------------------------------------------------------
@@ -260,19 +299,42 @@ def train():
 
     # ---- model ----
     model = LeanReconstructor(cfg)
+    model.head.train()
 
-    # ---- dataset ----
+    # ---- dataset split (clip-level 90/10) ----
     t0 = time.time()
+    all_clip_names = sorted(p.stem for p in Path("diffsynth/data/training_data").glob("clip-*.npz"))
+    n_val = max(1, int(len(all_clip_names) * cfg.val_fraction))
+    val_clip_names = set(all_clip_names[-n_val:])
+    train_clip_names = set(all_clip_names[:-n_val])
+    dbg(f"Clips: {len(all_clip_names)} total → {len(train_clip_names)} train / {len(val_clip_names)} val")
+
     train_dataset = StridedHandObjectDataset(
         data_root="diffsynth/data/training_data",
         frame_stride=cfg.frame_stride,
+        clip_names=train_clip_names,
     )
-    dbg(f"Dataset: {len(train_dataset)} samples (stride={cfg.frame_stride}) built in {time.time()-t0:.1f}s")
+    val_dataset = StridedHandObjectDataset(
+        data_root="diffsynth/data/training_data",
+        frame_stride=cfg.frame_stride,
+        clip_names=val_clip_names,
+    )
+    dbg(f"Samples: {len(train_dataset)} train / {len(val_dataset)} val  "
+        f"(built in {time.time()-t0:.1f}s)")
 
     train_sampler = ClipStreamSampler(train_dataset, shuffle_clips=True)
     train_loader = DataLoader(
         train_dataset,
         sampler=train_sampler,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+        persistent_workers=(cfg.num_workers > 0),
+    )
+    val_sampler = ClipStreamSampler(val_dataset, shuffle_clips=False)
+    val_loader = DataLoader(
+        val_dataset,
+        sampler=val_sampler,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
@@ -296,7 +358,7 @@ def train():
     # ---- logging ----
     writer = SummaryWriter(log_dir=cfg.log_dir, flush_secs=10)
     os.makedirs(os.path.dirname(cfg.save_model_path_prefix), exist_ok=True)
-    best_loss = float("inf")
+    best_val_loss = float("inf")
     global_step = 0
     class_names = ["right_hand", "left_hand", "object", "background"]
 
@@ -322,7 +384,7 @@ def train():
             images, gt_mask, _, _ = batch
 
             t_fwd = time.time()
-            classifications = model.forward(images).permute(0,3,1,2)
+            classifications = model.forward(images).permute(0, 3, 1, 2)
 
             if cfg.device == "cuda":
                 gt_mask = gt_mask.to("cuda", non_blocking=True)
@@ -334,11 +396,9 @@ def train():
             optimizer.step()
             scheduler.step()
 
-            if cfg.device == "cuda":
-                torch.cuda.synchronize()
+            loss_val = loss.item()  # implicit GPU sync
             step_time = time.time() - t_fwd
 
-            loss_val = loss.item()
             epoch_loss += loss_val
             global_step += 1
 
@@ -376,15 +436,28 @@ def train():
         epoch_per_class /= n_steps
         elapsed = time.time() - t_epoch
 
+        # ---- validation ----
+        val_loss, val_miou, val_per_class = evaluate(model, val_loader, criterion, cfg, class_names)
+
         writer.add_scalar("train/loss_epoch", avg_loss, epoch)
         writer.add_scalar("train/mIoU_epoch", avg_miou, epoch)
         writer.add_scalar("train/epoch_time_s", elapsed, epoch)
         for c, name in enumerate(class_names):
             writer.add_scalar(f"train/IoU_{name}", epoch_per_class[c].item(), epoch)
+        if val_loss is not None:
+            writer.add_scalar("val/loss_epoch", val_loss, epoch)
+            writer.add_scalar("val/mIoU_epoch", val_miou, epoch)
+            for c, name in enumerate(class_names):
+                writer.add_scalar(f"val/IoU_{name}", val_per_class[c].item(), epoch)
         writer.flush()
 
-        dbg(f"Epoch {epoch+1}/{cfg.epochs}  loss={avg_loss:.4f}  mIoU={avg_miou:.4f}  ({elapsed:.0f}s)")
-        best_loss = save_checkpoint(model.head, optimizer, epoch, avg_loss, avg_miou, cfg, best_loss)
+        val_str = f"val_loss={val_loss:.4f} val_mIoU={val_miou:.4f}" if val_loss is not None else "val=n/a"
+        dbg(f"Epoch {epoch+1}/{cfg.epochs}  loss={avg_loss:.4f}  mIoU={avg_miou:.4f}  {val_str}  ({elapsed:.0f}s)")
+
+        effective_val_loss = val_loss if val_loss is not None else avg_loss
+        best_val_loss = save_checkpoint(
+            model.head, optimizer, epoch, avg_loss, avg_miou, effective_val_loss, cfg, best_val_loss
+        )
 
     writer.close()
     dbg("=== Training complete ===")
