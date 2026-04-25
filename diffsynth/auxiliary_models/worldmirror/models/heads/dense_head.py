@@ -42,7 +42,8 @@ class DPTHead(nn.Module):
         out_channels: List[int] = [256, 512, 1024, 1024],
         pos_embed: bool = True,
         down_ratio: int = 1,
-        is_gsdpt: bool = False
+        is_gsdpt: bool = False,
+        num_seg_classes=0
     ) -> None:
         super(DPTHead, self).__init__()
         self.patch_size = patch_size
@@ -104,6 +105,15 @@ class DPTHead(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
             )
+        self.num_classes = num_seg_classes
+        if num_seg_classes > 0 and is_gsdpt:
+            self.seg_conv = nn.Sequential(
+                    nn.Conv2d(gs_dim, 64, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(64, num_seg_classes, kernel_size=1),
+            )
+            nn.init.normal_(self.seg_conv[-1].weight, std=0.001)
+            nn.init.zeros_(self.seg_conv[-1].bias)
 
     def forward(
         self,
@@ -138,17 +148,19 @@ class DPTHead(nn.Module):
         preds_chunks = []
         conf_chunks = []
         gs_chunks = []
+        seg_chunks = []
 
         for frame_start in range(0, S, frames_chunk_size):
             frame_end = min(frame_start + frames_chunk_size, S)
 
             if self.is_gsdpt:
-                gs, preds, conf = self._forward_impl(
+                gs, preds, conf, seg = self._forward_impl(
                     token_list, images, patch_start_idx, frame_start, frame_end
                 )
                 gs_chunks.append(gs)
                 preds_chunks.append(preds)
                 conf_chunks.append(conf)
+                seg_chunks.append(seg)
             else:
                 preds, conf = self._forward_impl(
                     token_list, images, patch_start_idx, frame_start, frame_end
@@ -158,7 +170,8 @@ class DPTHead(nn.Module):
 
         # Concatenate chunks along frame dimension
         if self.is_gsdpt:
-            return torch.cat(gs_chunks, dim=1), torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1),
+            seg_cat = torch.cat(seg_chunks, dim=1) if seg_chunks[0] is not None else None
+            return torch.cat(gs_chunks, dim=1), torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1), seg_cat
         else:
             return torch.cat(preds_chunks, dim=1), torch.cat(conf_chunks, dim=1)
 
@@ -228,21 +241,25 @@ class DPTHead(nn.Module):
         # Apply positional embedding after upsampling
         if self.pos_embed:
             fused = self._apply_pos_embed(fused, W, H)
-
-        # Generate predictions and confidence
+        
         if self.is_gsdpt:
-            # GSDPT: output features, predictions, and confidence
             out = self.scratch.output_conv2(fused)
             preds, conf = self.activate_head(out, activation=self.activation)
             preds = preds.reshape(B, S, *preds.shape[1:])
             conf = conf.reshape(B, S, *conf.shape[1:])
 
-            # Merge direct image features
             img_flat = images.reshape(B * S, -1, H, W)
             img_feat = self.input_merger(img_flat)
             fused = fused + img_feat
+
+            seg_logits = None
+            if self.num_seg_classes > 0:
+                seg_logits = self.seg_conv(fused)
+                seg_logits = seg_logits.permute(0,2,3,1)
+                seg_logits = seg_logits.reshape(B, S, H, W, self.num_seg_classes)
+
             fused = fused.reshape(B, S, *fused.shape[1:])
-            return fused, preds, conf
+            return fused, preds, conf, seg_logits
         else:
             # Standard: output predictions and confidence
             out = self.scratch.output_conv2(fused)

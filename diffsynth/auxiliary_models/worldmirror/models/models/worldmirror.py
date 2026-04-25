@@ -199,7 +199,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         if self.enable_hand_pred: 
             self.hand_pred_head = DPTHead(
                 dim_in = 2 * dim, 
-                output_dim= 4, 
+                output_dim= 2, 
                 patch_size=patch_size, 
                 activation="linear+none"
             )
@@ -211,7 +211,8 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 patch_size=patch_size,
                 features=gs_dim,
                 is_gsdpt=True,
-                activation="exp+expp1"
+                activation="exp+expp1",
+                num_seg_classes=2,
             )
             self.gs_renderer = GaussianSplatRenderer(
                 sh_degree=0,
@@ -358,13 +359,15 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             preds["classification_confidences"] = confidences
         # 3D Gaussian Splatting
         if self.enable_gs:
-            gs_feat, gs_depth, gs_depth_conf = self.gs_head(
+            gs_feat, gs_depth, gs_depth_conf, seg_logits = self.gs_head(
                 context_preds.get("token_list", token_list),
                 images=context_preds.get("imgs", imgs),
                 patch_start_idx=patch_start_idx
             )
             preds["gs_depth"] = gs_depth
             preds["gs_depth_conf"] = gs_depth_conf
+            if seg_logits is not None:
+                preds["seg_labels"] = seg_logits # [B, S, H, W, 2]
 
             # Dynamic GS attributes
             if self.enable_dynamic_gs_attr and use_motion:

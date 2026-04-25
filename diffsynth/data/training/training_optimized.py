@@ -27,7 +27,7 @@ from diffsynth.models.model_manager import ModelManager
 from datetime import datetime
 from dataclasses import dataclass, field
 
-from ..SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
+from ..SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset
 
 
 def dbg(msg: str):
@@ -41,11 +41,11 @@ def dbg(msg: str):
 @dataclass
 class TrainConfig:
     # Model Architecture
-    img_shape = (560, 336)
+    img_shape = (280, 280)
     patch_size: int = 14
     embed_dim: int = 1024
     token_dim: int = 2048
-    num_classes: int = 4
+    num_classes: int = 2
     patch_start_idx: int = 5
 
     # Training Hyperparameters
@@ -54,12 +54,11 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     lr_min_factor: float = 0.01  # cosine annealing decays to lr * this factor
-    class_weights = torch.tensor([0.98, 0.98, 0.98, 0.02])
+    class_weights = torch.tensor([0.03, 0.97])
 
     optimizer = torch.optim.AdamW
 
     # Dataset
-    frame_stride: int = 5  # sample every Nth frame (1 = all frames, original behaviour)
     val_fraction: float = 0.1  # fraction of clips held out for validation
 
     # Environment
@@ -114,7 +113,7 @@ class LeanReconstructor:
         n_train, n_total = 0, 0
         for name, param in self.reconstructor.named_parameters():
             n_total += 1
-            if "hand_pred_head" in name:
+            if "gs_head.seg_conv" in name:
                 param.requires_grad = True
                 n_train += 1
             else:
@@ -125,7 +124,8 @@ class LeanReconstructor:
 
         # Keep references for the two components we actually use
         self.backbone = self.reconstructor.visual_geometry_transformer
-        self.head = self.reconstructor.hand_pred_head
+        self.head = self.reconstructor.gs_head
+        self.trainable_part = self.reconstructor.gs_head.seg_conv
 
     @torch.no_grad()
     def _extract_features(self, imgs: torch.Tensor):
@@ -144,64 +144,47 @@ class LeanReconstructor:
         """Backbone (frozen, no_grad) -> hand_pred_head (trainable).
 
         Args:
-            images: [B, 3, H, W] batch of frames from DataLoader.
+            images: [B, S, 3, H, W] batch of frames from DataLoader.
 
         Returns:
-            classifications: [B, H, W, num_classes] logits (channels-last, as
+            classifications: [B, S, H, W, num_classes] logits (channels-last, as
                 produced by activate_head). Caller applies .permute(0,3,1,2) to
                 get [B, num_classes, H, W] for CrossEntropyLoss.
         """
         # Treat the batch dimension as the sequence dimension S expected by the backbone.
-        imgs = images.unsqueeze(0).to(self.cfg.device, non_blocking=True)
+        imgs = images.to(self.cfg.device, non_blocking=True)
+        B, S = imgs.shape[:2]
+
+        views = {
+            "img":       imgs,
+            "is_target": torch.zeros((B, S), dtype=torch.bool,  device=self.cfg.device),
+            "is_static": torch.zeros((B, S), dtype=torch.bool,  device=self.cfg.device),
+            "timestamp": torch.arange(S, dtype=torch.int64, device=self.cfg.device).unsqueeze(0).expand(B, -1),
+        }
+
 
         # 1. Frozen backbone — single pass, no graph built
         token_list, patch_start_idx = self._extract_features(imgs)
+        
+        with torch.no_grad():
+            with torch.amp.autocast(self.cfg.device, dtype=torch.bfloat16):
+                context_preds = self.reconstructor.prepare_contexts(
+                        views=views,
+                        cond_flags=[0,0,0],
+                        is_inference=False,
+                        use_motion=False,
+                )
+        context_token_list = context_preds.get("token_list", token_list)
+
 
         # 2. Trainable head — gradients flow here
         with torch.amp.autocast(self.cfg.device, dtype=torch.bfloat16):
-            classifications, _ = self.head(
-                token_list, images=imgs, patch_start_idx=patch_start_idx,
+            _, _, _, seg_logits = self.reconstructor.gs_head(
+                context_token_list, images=imgs, patch_start_idx=patch_start_idx,
             )
 
-        # head returns [B=1, S, H, W, num_classes] (channels-last) → squeeze batch dim
-        return classifications.squeeze(0).float()
-
-
-# ---------------------------------------------------------------------------
-# Subsampled dataset wrapper
-# ---------------------------------------------------------------------------
-
-class StridedHandObjectDataset(HandObjectSegmentationDataset):
-    """HandObjectSegmentationDataset with frame sub-sampling and optional clip filter.
-
-    Consecutive video frames are near-identical.  A stride of N keeps every
-    Nth frame, cutting dataset size (and redundancy) proportionally.
-
-    clip_names: optional set of clip stems (e.g. {"clip-000001", ...}) to
-        include.  If None, all clips in data_root are used.
-    """
-
-    def __init__(self, data_root: str, frame_stride: int = 1, streams=None, clip_names=None):
-        self._frame_stride = frame_stride
-        self._clip_names_filter = clip_names  # None → include all
-        super().__init__(data_root=data_root, streams=streams)
-
-    def _build_index(self) -> None:
-        for npz_path in sorted(Path(self.data_root).glob("clip-*.npz")):
-            clip_name = npz_path.stem
-            if self._clip_names_filter is not None and clip_name not in self._clip_names_filter:
-                continue
-            npz = np.load(str(npz_path), mmap_mode="r")
-            n_frames = next(
-                npz[k].shape[0] for k in npz.files if k.startswith("images_")
-            )
-            for stream in self.streams:
-                if f"images_{stream}" not in npz.files:
-                    continue
-                for frame_idx in range(0, n_frames, self._frame_stride):
-                    self.samples.append(
-                        {"clip_name": clip_name, "stream": stream, "frame_idx": frame_idx}
-                    )
+        # head returns [B, S, H, W, num_classes] (channels-last)
+        return seg_logits.float()
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +196,9 @@ def get_criterion(cfg):
 
 
 @torch.no_grad()
-def compute_miou(pred_logits, gt_mask, num_classes=4):
+def compute_miou(pred_logits, gt_mask, num_classes=2):
     pred = pred_logits.argmax(dim=1)
-    gt = gt_mask.argmax(dim=1)
+    gt = gt_mask
     intersection = torch.zeros(num_classes, device=pred.device)
     union = torch.zeros(num_classes, device=pred.device)
     for c in range(num_classes):
@@ -269,10 +252,12 @@ def evaluate(model, val_loader, criterion, cfg, class_names):
     per_class = torch.zeros(cfg.num_classes, device=cfg.device)
     for batch in val_loader:
         images, gt_mask, _, _ = batch
-        classifications = model.forward(images).permute(0, 3, 1, 2)
-        if cfg.device == "cuda":
-            gt_mask = gt_mask.to("cuda", non_blocking=True)
-        loss = criterion(classifications, gt_mask.argmax(dim=1).long())
+        classifications = model.forward(images)
+        classifications = classifications.permute(0,1,4,2,3)
+        B,S,C,H,W = classifications.shape
+        classifications = classifications.view(B*S,C,H,W)
+        gt_mask = gt_mask.to(cfg.device).view(B*S,H,W)
+        loss = criterion(classifications, gt_mask)
         miou, pc = compute_miou(classifications, gt_mask, cfg.num_classes)
         total_loss += loss.item()
         total_miou += miou
@@ -291,8 +276,8 @@ def evaluate(model, val_loader, criterion, cfg, class_names):
 def train():
     dbg("=== train() [optimized] ===")
     cfg = TrainConfig()
-    dbg(f"Config: device={cfg.device}, batch={cfg.batch_size}, epochs={cfg.epochs}, "
-        f"stride={cfg.frame_stride}, lr={cfg.learning_rate}")
+    dbg(f"Config: device={cfg.device}, batch={cfg.batch_size}, epochs={cfg.epochs},"
+        f"lr={cfg.learning_rate}")
 
     if cfg.device == "cuda":
         dbg(f"CUDA: {torch.cuda.get_device_name(0)} | torch={torch.__version__}")
@@ -309,32 +294,28 @@ def train():
     train_clip_names = set(all_clip_names[:-n_val])
     dbg(f"Clips: {len(all_clip_names)} total → {len(train_clip_names)} train / {len(val_clip_names)} val")
 
-    train_dataset = StridedHandObjectDataset(
-        data_root="diffsynth/data/training_data",
-        frame_stride=cfg.frame_stride,
+    train_dataset = HandObjectSegmentationDataset(
+        data_root="diffsynth/data/training_data_amodal",
         clip_names=train_clip_names,
     )
-    val_dataset = StridedHandObjectDataset(
-        data_root="diffsynth/data/training_data",
-        frame_stride=cfg.frame_stride,
+    val_dataset = HandObjectSegmentationDataset(
+        data_root="diffsynth/data/training_data_amodal",
         clip_names=val_clip_names,
     )
     dbg(f"Samples: {len(train_dataset)} train / {len(val_dataset)} val  "
         f"(built in {time.time()-t0:.1f}s)")
 
-    train_sampler = ClipStreamSampler(train_dataset, shuffle_clips=True)
     train_loader = DataLoader(
         train_dataset,
-        sampler=train_sampler,
+        shuffle=True,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
         persistent_workers=(cfg.num_workers > 0),
     )
-    val_sampler = ClipStreamSampler(val_dataset, shuffle_clips=False)
     val_loader = DataLoader(
         val_dataset,
-        sampler=val_sampler,
+        shuffle=False,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
@@ -360,7 +341,7 @@ def train():
     os.makedirs(os.path.dirname(cfg.save_model_path_prefix), exist_ok=True)
     best_val_loss = float("inf")
     global_step = 0
-    class_names = ["right_hand", "left_hand", "object", "background"]
+    class_names = ["background", "foreground"]
 
     # ---- epochs ----
     for epoch in range(cfg.epochs):
@@ -384,12 +365,13 @@ def train():
             images, gt_mask, _, _ = batch
 
             t_fwd = time.time()
-            classifications = model.forward(images).permute(0, 3, 1, 2)
+            classifications = model.forward(images)
+            classifications = classifications.permute(0,1,4,2,3)
+            B,S,C,H,W = classifications.shape
+            classifications = classifications.view(B*S,C,H,W)
+            gt_mask = gt_mask.to(cfg.device).view(B*S,H,W)
 
-            if cfg.device == "cuda":
-                gt_mask = gt_mask.to("cuda", non_blocking=True)
-
-            loss = criterion(classifications, gt_mask.argmax(dim=1).long())
+            loss = criterion(classifications, gt_mask)
 
             optimizer.zero_grad()
             loss.backward()
