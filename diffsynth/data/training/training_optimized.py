@@ -16,9 +16,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
+
 
 from diffsynth.auxiliary_models.worldmirror.models.heads.dense_head import DPTHead
 from diffsynth.auxiliary_models.worldmirror.models.models.worldmirror import WorldMirror
@@ -27,7 +29,7 @@ from diffsynth.models.model_manager import ModelManager
 from datetime import datetime
 from dataclasses import dataclass, field
 
-from ..SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
+from diffsynth.data.SimpleHandObjectSegmentationDataset import HandObjectSegmentationDataset, ClipStreamSampler
 
 
 def dbg(msg: str):
@@ -41,7 +43,7 @@ def dbg(msg: str):
 @dataclass
 class TrainConfig:
     # Model Architecture
-    img_shape = (560, 336)
+    img_shape = (280,280)
     patch_size: int = 14
     embed_dim: int = 1024
     token_dim: int = 2048
@@ -49,17 +51,17 @@ class TrainConfig:
     patch_start_idx: int = 5
 
     # Training Hyperparameters
-    batch_size: int = 10
+    batch_size: int = 50
     epochs: int = 10
-    learning_rate: float = 3e-4
+    learning_rate: float = 0.0001
     weight_decay: float = 0.01
     lr_min_factor: float = 0.01  # cosine annealing decays to lr * this factor
     class_weights = torch.tensor([0.98, 0.98, 0.98, 0.02])
 
     optimizer = torch.optim.AdamW
-
+    grad_clip_norm = 1.0
     # Dataset
-    frame_stride: int = 5  # sample every Nth frame (1 = all frames, original behaviour)
+    frame_stride: int = 3  # sample every Nth frame (1 = all frames, original behaviour)
     val_fraction: float = 0.1  # fraction of clips held out for validation
 
     # Environment
@@ -153,7 +155,7 @@ class LeanReconstructor:
         """
         # Treat the batch dimension as the sequence dimension S expected by the backbone.
         imgs = images.unsqueeze(0).to(self.cfg.device, non_blocking=True)
-
+        cond_flags = []
         # 1. Frozen backbone — single pass, no graph built
         token_list, patch_start_idx = self._extract_features(imgs)
 
@@ -209,7 +211,7 @@ class StridedHandObjectDataset(HandObjectSegmentationDataset):
 # ---------------------------------------------------------------------------
 
 def get_criterion(cfg):
-    return nn.CrossEntropyLoss(weight=cfg.class_weights.to(cfg.device))
+    return nn.CrossEntropyLoss(weight=cfg.class_weights.to(cfg.device), label_smoothing=0.2)
 
 
 @torch.no_grad()
@@ -257,7 +259,25 @@ def save_checkpoint(head, optimizer, epoch, train_loss, avg_miou, val_loss, cfg,
         dbg(f"  -> new best val (val_loss={best_val_loss:.4f})")
     return best_val_loss
 
+class DiceLoss:
+    def __init__(self, smooth=1):
+        self.smooth = smooth
+    
+    def __call__(self, pred, target):
+        pred = F.softmax(pred, dim=1)  # Convert logits to probabilities
+        num_classes = pred.shape[1]  # Number of classes (C)
+        dice = 0  # Initialize Dice loss accumulator
+    
+        for c in range(num_classes):  # Loop through each class
+            pred_c = pred[:, c]  # Predictions for class c
+            target_c = target[:, c]  # Ground truth for class c
+        
+            intersection = (pred_c * target_c).sum(dim=(1, 2))  # Element-wise multiplication
+            union = pred_c.sum(dim=(1, 2)) + target_c.sum(dim=(1, 2))  # Sum of all pixels
+        
+            dice += (2. * intersection + self.smooth) / (union + self.smooth)  # Per-class Dice score
 
+        return 1 - dice.mean() / num_classes  # Average Dice Loss across classes
 # ---------------------------------------------------------------------------
 # Validation loop
 # ---------------------------------------------------------------------------
@@ -282,7 +302,6 @@ def evaluate(model, val_loader, criterion, cfg, class_names):
     if n_steps == 0:
         return None, None, None
     return total_loss / n_steps, total_miou / n_steps, per_class / n_steps
-
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -342,19 +361,23 @@ def train():
     )
 
     # ---- optimiser + scheduler ----
+    c_w = torch.zeros(4)
+    for _, gt_mask, *_ in iter(train_loader): 
+        c_w += torch.bincount(gt_mask.argmax(dim=1).view(-1), minlength=4)
+    c_w = 1/ (c_w + 1e-6)
+    c_w = c_w / c_w.sum()
+    cfg.class_weights = c_w
+    print("c_w", c_w)
     criterion = get_criterion(cfg=cfg)
+    dice_loss = DiceLoss()
     trainable = [p for p in model.head.parameters() if p.requires_grad]
     dbg(f"Optimizer: {len(trainable)} trainable tensors")
     optimizer = cfg.optimizer(trainable, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-
-    steps_per_epoch = math.ceil(len(train_dataset) / cfg.batch_size)
-    total_steps = steps_per_epoch * cfg.epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=cfg.learning_rate * cfg.lr_min_factor,
+    
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=0.80, last_epoch=-1
     )
-    dbg(f"Scheduler: CosineAnnealingLR over {total_steps} steps "
-        f"(~{steps_per_epoch}/epoch), eta_min={cfg.learning_rate * cfg.lr_min_factor:.1e}")
-
+    
     # ---- logging ----
     writer = SummaryWriter(log_dir=cfg.log_dir, flush_secs=10)
     os.makedirs(os.path.dirname(cfg.save_model_path_prefix), exist_ok=True)
@@ -373,6 +396,7 @@ def train():
         loader_iter = iter(train_loader)
         step = -1
         while True:
+            optimizer.zero_grad()
             try:
                 t_fetch = time.time()
                 batch = next(loader_iter)
@@ -385,16 +409,16 @@ def train():
 
             t_fwd = time.time()
             classifications = model.forward(images).permute(0, 3, 1, 2)
-
+            b,c,h,w = classifications.shape
+            new_c = torch.unique(classifications.view(b,c,-1), dim=2)
+            #print("num unique: ", len(new_c.unique()))
             if cfg.device == "cuda":
                 gt_mask = gt_mask.to("cuda", non_blocking=True)
-
-            loss = criterion(classifications, gt_mask.argmax(dim=1).long())
-
-            optimizer.zero_grad()
+            loss = criterion(classifications, gt_mask.argmax(dim=1).long()) + 100 * dice_loss(classifications, gt_mask)
+            
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.grad_clip_norm)
             optimizer.step()
-            scheduler.step()
 
             loss_val = loss.item()  # implicit GPU sync
             step_time = time.time() - t_fwd
@@ -426,10 +450,12 @@ def train():
             elif global_step > 0 and global_step % 10_000 == 0:
                 save_step_checkpoint(model.head, optimizer, epoch, global_step, loss_val, miou, cfg)
 
+
+        scheduler.step()
         if step < 0:
             dbg("WARNING: epoch produced 0 steps.")
             continue
-
+        
         n_steps = step + 1
         avg_loss = epoch_loss / n_steps
         avg_miou = epoch_miou / n_steps
