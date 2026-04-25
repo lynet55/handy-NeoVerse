@@ -83,6 +83,8 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
                         tensor.zero_() 
             missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False, assign=False)
             model.to(dtype=torch_dtype, device = device)
+            if len(missing_keys) > 0 and hasattr(model_class, "initialize"):
+                model.initialize(missing_keys)
         loaded_model_names.append(model_name)
         loaded_models.append(model)
     return loaded_model_names, loaded_models
