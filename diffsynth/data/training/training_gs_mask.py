@@ -286,21 +286,6 @@ class StridedHandObjectDataset(HandObjectSegmentationDataset):
 # Losses
 # ---------------------------------------------------------------------------
 
-def bce_loss_weighted(rendered_logits, gt, class_weights):
-    """Per-class binary BCE-with-logits with class weighting.
-
-    rendered_logits: [B, C, H, W] rendered mask logits from the rasterizer.
-    gt: [B, C, H, W] one-hot floats.
-
-    This is the "0/1 loss" the supervisor described: each Gaussian mask channel is treated
-    as a binary foreground/background prediction per class.
-    """
-    w = class_weights.view(1, -1, 1, 1).to(rendered_logits.device)
-    return F.binary_cross_entropy_with_logits(
-        rendered_logits, gt.float(), weight=w.expand_as(rendered_logits)
-    )
-
-
 class DiceLoss:
     """Soft Dice loss for multi-class segmentation (ignores absent classes).
 
@@ -444,7 +429,7 @@ def load_checkpoint(model, optimizer, cfg, train_loader_len: int):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, val_loader, dice_loss_fn, cfg, class_names):
+def evaluate(model, val_loader, criterion, dice_loss_fn, cfg, class_names):
     model.set_eval_mode()
     total_loss = 0.0
     total_miou = 0.0
@@ -461,9 +446,10 @@ def evaluate(model, val_loader, dice_loss_fn, cfg, class_names):
         if rendered.shape[-2:] != gt_mask.shape[-2:]:
             gt_mask = F.interpolate(gt_mask, size=rendered.shape[-2:], mode="nearest")
 
-        bce = bce_loss_weighted(rendered, gt_mask, cfg.class_weights)
+        gt_cls = gt_mask.argmax(dim=1).long()
+        ce = criterion(rendered, gt_cls)
         dl = dice_loss_fn(rendered, gt_mask)
-        loss = bce + dl
+        loss = ce + dl
 
         miou, pc_iou = compute_miou(rendered, gt_mask, cfg.num_classes)
         pc_acc = compute_per_class_accuracy(rendered, gt_mask, cfg.num_classes)
@@ -521,6 +507,7 @@ def train():
                               batch_size=cfg.batch_size, num_workers=cfg.num_workers,
                               pin_memory=cfg.pin_memory, persistent_workers=(cfg.num_workers > 0))
 
+    criterion = nn.CrossEntropyLoss(weight=cfg.class_weights.to(cfg.device), label_smoothing=0.0)
     dice_loss_fn = DiceLoss()
     dbg(f"class weights (bg=1): {cfg.class_weights.tolist()}")
 
@@ -602,9 +589,10 @@ def train():
                                    for i, name in enumerate(class_names)}
                     dbg(f"pred class pixel counts: {pred_counts}")
 
-            bce = bce_loss_weighted(rendered, gt_mask, cfg.class_weights)
+            gt_cls = gt_mask.argmax(dim=1).long()
+            ce = criterion(rendered, gt_cls)
             dl = dice_loss_fn(rendered, gt_mask)
-            loss = bce + dl
+            loss = ce + dl
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.grad_clip_norm)
@@ -625,7 +613,7 @@ def train():
 
             # TensorBoard — per step
             writer.add_scalar("train/loss_step", loss_val, global_step)
-            writer.add_scalar("train/bce_step", bce.item(), global_step)
+            writer.add_scalar("train/ce_step", ce.item(), global_step)
             writer.add_scalar("train/dice_step", dl.item(), global_step)
             writer.add_scalar("train/mIoU_step", miou, global_step)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
@@ -645,7 +633,7 @@ def train():
                 pc_acc = [f"{n}={per_class_acc[i].item():.2f}" for i, n in enumerate(class_names)]
                 dbg(
                     f"  step {step}: loss={loss_val:.3f} "
-                    f"(bce={bce.item():.3f} dice={dl.item():.3f}) "
+                    f"(ce={ce.item():.3f} dice={dl.item():.3f}) "
                     f"mIoU={miou:.4f} | avg(20) loss={avg_loss_w:.3f} mIoU={avg_miou_w:.4f} "
                     f"IoU[{' '.join(pc_iou)}] Acc[{' '.join(pc_acc)}] "
                     f"lr={optimizer.param_groups[0]['lr']:.2e} "
@@ -668,7 +656,7 @@ def train():
 
         # Validation
         val_loss, val_miou, val_per_class_iou, val_per_class_acc, val_confusion = evaluate(
-            model, val_loader, dice_loss_fn, cfg, class_names
+            model, val_loader, criterion, dice_loss_fn, cfg, class_names
         )
 
         # TensorBoard — per epoch (train)
