@@ -120,7 +120,7 @@ class NeoVerseReconstructor:
         classifications = predictions["seg_labels"]
         input_w2c = homo_matrix_inverse(input_c2w)
 
-        target_rgb, _, target_alphas = self.reconstructor.gs_renderer.rasterizer.forward(
+        target_rgb, _, target_alphas, _ = self.reconstructor.gs_renderer.rasterizer.forward(
             gaussians,
             render_viewmats=[input_w2c],
             render_Ks=[input_intrs],

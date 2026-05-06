@@ -77,6 +77,31 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
                 model.load_state_dict(model_state_dict, strict=True, assign=False)
                 model = model.to(dtype=torch_dtype, device=device)
         else:
+            current_state_dict = model.state_dict()
+            for key, loaded_tensor in list(model_state_dict.items()):
+                current_tensor = current_state_dict.get(key)
+                if not isinstance(loaded_tensor, torch.Tensor) or current_tensor is None:
+                    continue
+                if loaded_tensor.shape == current_tensor.shape:
+                    continue
+
+                can_prefix_copy = (
+                    loaded_tensor.ndim == current_tensor.ndim
+                    and loaded_tensor.shape[0] < current_tensor.shape[0]
+                    and loaded_tensor.shape[1:] == current_tensor.shape[1:]
+                )
+                if can_prefix_copy:
+                    expanded_tensor = current_tensor.detach().clone()
+                    expanded_tensor[: loaded_tensor.shape[0]] = loaded_tensor.to(
+                        device=expanded_tensor.device,
+                        dtype=expanded_tensor.dtype,
+                    )
+                    model_state_dict[key] = expanded_tensor
+                    print(
+                        f"        Expanded checkpoint tensor {key}: "
+                        f"{tuple(loaded_tensor.shape)} -> {tuple(current_tensor.shape)}"
+                    )
+
             with torch.no_grad():
                 for tensor in model.state_dict().values():
                     if isinstance(tensor, torch.Tensor):
@@ -475,4 +500,3 @@ class ModelManager:
     def to(self, device):
         for model in self.model:
             model.to(device)
-

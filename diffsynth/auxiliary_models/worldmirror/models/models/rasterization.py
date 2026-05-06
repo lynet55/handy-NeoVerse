@@ -36,7 +36,8 @@ class Gaussians:
         backward_vel: Optional[Float[Tensor, "*batch 3"]] = None,
         backward_scales: Optional[Float[Tensor, "*batch 3"]] = None,
         backward_rotations: Optional[Float[Tensor, "*batch 3"]] = None,
-        seg_label: Optional[Float[Tensor, "*batch"]] = None,  # int64: 0=left_hand, 1=right_hand, 2=object, 3=background
+        seg_label: Optional[Float[Tensor, "*batch"]] = None,  # int64: 0=right_hand, 1=left_hand, 2=object, 3=background
+        mask_logits: Optional[Float[Tensor, "*batch num_classes"]] = None,  # per-Gaussian mask logits [N, C]
     ):
         self.means = means
         self.harmonics = harmonics
@@ -47,6 +48,7 @@ class Gaussians:
         self.timestamp = timestamp
         self.life_span = life_span
         self.life_span_gamma = life_span_gamma
+        self.mask_logits = mask_logits
 
         if forward_timestamp is not None:
             assert forward_timestamp >= timestamp, "Forward timestamp must be greater than or equal to current timestamp."
@@ -117,6 +119,7 @@ class Gaussians:
         transitioned_scales = self.transition_scales(target_timestamp, mask)
         transitioned_rotations = self.transition_rotations(target_timestamp, mask)
         transitioned_seg_label = self.transition_seg_label(target_timestamp, mask)
+        transitioned_mask_logits = self.transition_mask_logits(target_timestamp, mask)
         return Gaussians(
             means=transitioned_means,
             harmonics=transitioned_harmonics,
@@ -124,6 +127,7 @@ class Gaussians:
             scales=transitioned_scales,
             rotations=transitioned_rotations,
             seg_label=transitioned_seg_label,
+            mask_logits=transitioned_mask_logits,
         )
 
     def transition_means(self, target_timestamp, mask):
@@ -171,6 +175,18 @@ class Gaussians:
             return self.seg_label[mask]
         else:
             return self.seg_label[[]]
+
+    def transition_mask_logits(self, target_timestamp, mask):
+        if self.mask_logits is None:
+            return None
+        if self.timestamp == -1 or target_timestamp == self.timestamp:
+            return self.mask_logits[mask]
+        elif target_timestamp > self.timestamp and target_timestamp < self.forward_timestamp:
+            return self.mask_logits[mask]
+        elif target_timestamp < self.timestamp and target_timestamp > self.backward_timestamp:
+            return self.mask_logits[mask]
+        else:
+            return self.mask_logits[[]]
 
     def transition_opacities(self, target_timestamp, mask):
         opacities = self.opacities[mask]
@@ -311,9 +327,9 @@ class Rasterizer:
         assert len(render_splats) == len(render_viewmats) == len(render_Ks) == len(render_timestamps), \
             "Number of batches in gaussians must match the batch size in render_viewmats and render_Ks."
         # Prevent OOM by using chunked rendering
-        rendered_colors_list, rendered_depths_list, rendered_alphas_list = [], [], []
+        rendered_colors_list, rendered_depths_list, rendered_alphas_list, rendered_masks_list = [], [], [], []
         for b_idx in range(len(render_splats)):
-            batch_colors_list, batch_depths_list, batch_alphas_list = [], [], []
+            batch_colors_list, batch_depths_list, batch_alphas_list, batch_masks_list = [], [], [], []
             batch_splats = render_splats[b_idx]
             batch_viewmats = render_viewmats[b_idx]
             batch_Ks = render_Ks[b_idx]
@@ -358,20 +374,30 @@ class Rasterizer:
                         transitioned_splats.append(
                             splats.transition(timestamp_i, mask=mask)
                         )
-                rendered_colors, rendered_depths, rendered_alphas = self.rasterize_splats(
+                rendered_colors, rendered_depths, rendered_alphas, rendered_masks = self.rasterize_splats(
                     transitioned_splats, viewmats_i[None], Ks_i[None],
                     width=width, height=height, sh_degree=sh_degree,
                 )
                 batch_colors_list.append(rendered_colors)
                 batch_depths_list.append(rendered_depths)
                 batch_alphas_list.append(rendered_alphas)
-            rendered_colors_list.append(torch.cat(batch_colors_list, dim=0))  # V H W 3
-            rendered_depths_list.append(torch.cat(batch_depths_list, dim=0))  # V H W 1
-            rendered_alphas_list.append(torch.cat(batch_alphas_list, dim=0))  # V H W 1
+                batch_masks_list.append(rendered_masks)
+            rendered_colors_list.append(torch.cat(batch_colors_list, dim=0))   # V H W 3
+            rendered_depths_list.append(torch.cat(batch_depths_list, dim=0))   # V H W 1
+            rendered_alphas_list.append(torch.cat(batch_alphas_list, dim=0))   # V H W 1
+            if all(m is not None for m in batch_masks_list):
+                rendered_masks_list.append(torch.cat(batch_masks_list, dim=0)) # V H W C
+            else:
+                rendered_masks_list.append(None)
         rendered_colors = torch.stack(rendered_colors_list, dim=0)
         rendered_depths = torch.stack(rendered_depths_list, dim=0)
         rendered_alphas = torch.stack(rendered_alphas_list, dim=0)
-        return rendered_colors, rendered_depths, rendered_alphas
+        rendered_masks = (
+            torch.stack(rendered_masks_list, dim=0)
+            if all(m is not None for m in rendered_masks_list)
+            else None
+        )
+        return rendered_colors, rendered_depths, rendered_alphas, rendered_masks
 
     def rasterize_splats(
         self,
@@ -381,27 +407,29 @@ class Rasterizer:
         width: int,
         height: int,
         **kwargs,
-    ) -> Tuple[Tensor, Tensor, Dict]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
         if len(splats) > 0:
             means = torch.cat([splat.means for splat in splats], dim=0)
             quats = torch.cat([splat.rotations for splat in splats], dim=0)
             scales = torch.cat([splat.scales for splat in splats], dim=0)
             opacities = torch.cat([splat.opacities for splat in splats], dim=0)
             colors = torch.cat([splat.harmonics for splat in splats], dim=0)
+            all_mask_logits = [splat.mask_logits for splat in splats if splat.mask_logits is not None]
+            mask_logits = torch.cat(all_mask_logits, dim=0) if all_mask_logits else None
 
         if len(splats) == 0 or means.shape[0] == 0:
             return (
                 torch.zeros((1, height, width, 3), dtype=torch.float32, device=viewmats.device),
                 torch.zeros((1, height, width, 1), dtype=torch.float32, device=viewmats.device),
                 torch.zeros((1, height, width, 1), dtype=torch.float32, device=viewmats.device),
+                None,
             )
 
-        render_colors, render_alphas, _ = rasterization(
+        shared_kwargs = dict(
             means=means,
             quats=quats,
             scales=scales,
             opacities=opacities,
-            colors=colors,
             viewmats=viewmats,  # [C, 4, 4]
             Ks=Ks,  # [C, 3, 3]
             width=width,
@@ -417,11 +445,32 @@ class Rasterizer:
             distributed=self.distributed,
             camera_model=self.camera_model,
             with_eval3d=self.with_eval3d,
-            render_mode="RGB+ED",
-            backgrounds=means.new_ones((1, 3)) if self.backgrounds == "white" else None,
             **kwargs,
         )
-        return render_colors[..., :3].clamp(0.0, 1.0), render_colors[..., 3:4], render_alphas
+
+        render_colors, render_alphas, _ = rasterization(
+            colors=colors,
+            render_mode="RGB+ED",
+            backgrounds=means.new_ones((1, 3)) if self.backgrounds == "white" else None,
+            **shared_kwargs,
+        )
+
+        # Render mask logits as extra channels via a second alpha-compositing pass.
+        # Keep these as logits: downstream segmentation training applies CE/softmax.
+        rendered_masks = None
+        if mask_logits is not None:
+            num_classes = mask_logits.shape[-1]
+            mask_kwargs = dict(shared_kwargs)
+            mask_kwargs["sh_degree"] = None
+            mask_colors, _, _ = rasterization(
+                colors=mask_logits,                 # [N, C] class logits
+                render_mode="RGB",                  # no depth channel, C channels composited
+                backgrounds=means.new_zeros((1, num_classes)),
+                **mask_kwargs,
+            )
+            rendered_masks = mask_colors  # [1, H, W, num_classes]
+
+        return render_colors[..., :3].clamp(0.0, 1.0), render_colors[..., 3:4], render_alphas, rendered_masks
 
 
 class GaussianSplatRenderer(nn.Module):
@@ -459,15 +508,18 @@ class GaussianSplatRenderer(nn.Module):
         self.dynamic_threshold2 = dynamic_threshold2
         self.occlusion_threshold = occlusion_threshold
 
-        # Predict Gaussian parameters from GS features (quaternions/scales/opacities/SH/weights)
+        self.num_mask_classes = 4  # right_hand, left_hand, object, background
+
+        # Predict Gaussian parameters from GS features (quaternions/scales/opacities/SH/weights/mask_logits)
         splits_and_inits = [
-            (4, 1.0, 0.0),                # quats
-            (3, 0.00003, -7.0),           # scales
-            (1, 1.0, -2.0),               # opacities
-            (3 * self.nums_sh, 1.0, 0.0), # residual_sh
-            (1, 1.0, -2.0),               # weights for 3DGS or life span for 4DGS
+            (4, 1.0, 0.0),                     # quats
+            (3, 0.00003, -7.0),                # scales
+            (1, 1.0, -2.0),                    # opacities
+            (3 * self.nums_sh, 1.0, 0.0),      # residual_sh
+            (1, 1.0, -2.0),                    # weights for 3DGS or life span for 4DGS
+            (self.num_mask_classes, 0.01, 0.0),# mask logits (small init → near-uniform at start)
         ]
-        gaussian_raw_channels = 4 + 3 + 1 + self.nums_sh * 3 + 1
+        gaussian_raw_channels = 4 + 3 + 1 + self.nums_sh * 3 + 1 + self.num_mask_classes
 
         self.gs_head = nn.Sequential(
             nn.Conv2d(feature_dim // 2, feature_dim, kernel_size=3, padding=1, bias=False),
@@ -681,8 +733,8 @@ class GaussianSplatRenderer(nn.Module):
         splats["gs_feats"] = gs_params.reshape(B, S, H * W, -1)
 
         # Split Gaussian parameters
-        quats, scales, opacities, residual_sh, weights = torch.split(
-            gs_params, [4, 3, 1, self.nums_sh * 3, 1], dim=-1
+        quats, scales, opacities, residual_sh, weights, mask_logits = torch.split(
+            gs_params, [4, 3, 1, self.nums_sh * 3, 1, self.num_mask_classes], dim=-1
         )
 
         # Apply activation functions to Gaussian parameters
@@ -699,6 +751,7 @@ class GaussianSplatRenderer(nn.Module):
         splats["sh"] = new_sh + residual_sh
 
         splats["weights"] = act_gs.reg_dense_weights(weights.reshape(B, S, H * W))
+        splats["mask_logits"] = mask_logits.reshape(B, S, H * W, self.num_mask_classes)
 
         # Compute 3D positions based on specified method
         depth_from, camera_from = position_from.split("+")
@@ -802,8 +855,9 @@ class GaussianSplatRenderer(nn.Module):
 
         s_idx, n_idx = constant_indices[:, 0], constant_indices[:, 1]
         constant_splats = {}
-        for key in ["means", "quats", "scales", "opacities", "sh", "conf", "weights"]:
-            constant_splats[key] = splats[key][batch_idx][s_idx, n_idx]
+        for key in ["means", "quats", "scales", "opacities", "sh", "conf", "weights", "mask_logits"]:
+            if key in splats:
+                constant_splats[key] = splats[key][batch_idx][s_idx, n_idx]
 
         # Apply confidence filtering before pruning
         if self.enable_conf_filter:
@@ -825,6 +879,7 @@ class GaussianSplatRenderer(nn.Module):
                 (constant_splats["means"].shape[0],), 3,
                 dtype=torch.int64, device=constant_splats["means"].device,
             ),
+            mask_logits=constant_splats.get("mask_logits"),
         )
         return gaussians
 
@@ -857,7 +912,8 @@ class GaussianSplatRenderer(nn.Module):
                     backward_timestamp=splats["timestamp"][batch_idx, s - 1].item() if s > 0 else None,
                     backward_vel=splats["world_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "world_velocity_bwd" in splats and s > 0 else None,
                     backward_rotations=splats["angular_velocity_bwd"][batch_idx, s - 1][dynamic_mask] if "angular_velocity_bwd" in splats and s > 0 else None,
-                    seg_label=splats["seg_labels"][batch_idx, s][dynamic_mask],
+                    seg_label=splats["seg_labels"][batch_idx, s][dynamic_mask] if "seg_labels" in splats else None,
+                    mask_logits=splats["mask_logits"][batch_idx, s][dynamic_mask] if "mask_logits" in splats else None,
                 )
                 gaussian_list.append(gs)
         return gaussian_list
@@ -987,4 +1043,4 @@ if __name__ == "__main__":
         "opacities": opacities,
         "colors": colors,
     }
-    colors, alphas, _ = rasterizer.rasterize_splats(splats, viewmats, Ks, width, height)
+    colors, alphas, _, _ = rasterizer.rasterize_splats(splats, viewmats, Ks, width, height)

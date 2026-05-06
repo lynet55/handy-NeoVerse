@@ -72,7 +72,7 @@ def reconstruct_image(image_path, out_path):
 
     input_w2c = homo_matrix_inverse(input_c2w)
 
-    target_rgb, _, _ = reconstructor.gs_renderer.rasterizer.forward(
+    target_rgb, _, _, _ = reconstructor.gs_renderer.rasterizer.forward(
         gaussians,
         render_viewmats=[input_w2c],
         render_Ks=[input_intrs],

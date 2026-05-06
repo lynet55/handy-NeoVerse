@@ -111,12 +111,12 @@ class NeoVerseReconstructor:
         # --- Point cloud GLB ---
         input_w2c = homo_matrix_inverse(input_c2w)  # [S, 4, 4]
 
-        target_rgb, _ , target_alphas = self.reconstructor.gs_renderer.rasterizer.forward(
-        gaussians,
-        render_viewmats=[input_w2c],
-        render_Ks=[input_intrs],
-        render_timestamps=[input_timestamps],
-        sh_degree=0, width=self.cfg.img_shape[0], height=self.cfg.img_shape[1],
+        target_rgb, _, target_alphas, _ = self.reconstructor.gs_renderer.rasterizer.forward(
+            gaussians,
+            render_viewmats=[input_w2c],
+            render_Ks=[input_intrs],
+            render_timestamps=[input_timestamps],
+            sh_degree=0, width=self.cfg.img_shape[0], height=self.cfg.img_shape[1],
         )
         return target_rgb, target_alphas, classifications.permute(0, 1, 4, 2, 3)[0]
 
