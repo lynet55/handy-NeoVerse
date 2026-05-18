@@ -41,7 +41,19 @@ echo "------------------------------------------"
 # ---------- Run ----------
 START=$(date +%s)
 
-python -u -m diffsynth.data.benchmarking.benchmark_full
+python -u -m diffsynth.data.benchmarking.benchmark \
+    --reconstruction-model-path models/NeoVerse/reconstructor.ckpt \
+    --hand-head-path models/NeoVerse/hand_seg_model_opt_run20260507-224244_epoch005.ckpt \
+    --data-root diffsynth/data/training_data \
+    --val-fraction 0.1 \
+    --frame-stride 3 \
+    --window-size 6 \
+    --img-shape 280 280 \
+    --num-classes 4 \
+    --num-workers 2 \
+    --output-dir outputs/benchmark \
+    --run-seg \
+    --run-render
 EXIT_CODE=$?
 
 END=$(date +%s)
